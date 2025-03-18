@@ -18,7 +18,12 @@ This project is a slideshow player that synchronizes image transitions with real
 
 ## Usage
 
-Run `song_slide.py` and adjust the `Peak Factor` and `Valley Factor` as needed.
+1. Run `song_slide.py`.
+2. Click **Select Folder** to choose a directory with images.
+3. (Optional) Enable **Subfolders** to include images from subdirectories.
+4. (Optional) Enable **Random** to shuffle the image order.
+5. Adjust the **Peak Factor** and **Valley Factor** to fine-tune sensitivity.
+6. Start playing music, and the slideshow will sync with the detected peaks.
 
 ### How It Works
 - The program analyzes the audio in real time and detects peaks in volume and frequency.
