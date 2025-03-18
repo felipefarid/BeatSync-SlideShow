@@ -13,7 +13,7 @@ This project is a slideshow player that synchronizes image transitions with real
 - **Manual controls**: Fine-tune detection parameters using sliders.
 
 ## Screenshot
-![Output](output.png)
+![Sond_Slide](Song_Slide.png)
 
 ## Installation
 Ensure you have Python installed and the required dependencies:
