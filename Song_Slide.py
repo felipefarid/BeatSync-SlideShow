@@ -135,16 +135,36 @@ class ImageViewer:
         self.image_formats = ["jpg", "jpeg", "png", "bmp", "gif"]
 
         # Audio settings
-        self.samplerate = 1024
-        self.blocksize = 32
+        self.samplerate = 44100  # Standard audio sample rate
+        self.blocksize = 1024    # Better block size for processing
         self.volume_window = []
         self.window_size = 25
         self.volume_threshold_factor = 1.20
-        self.valley_threshold_factor = 0.90
+        self.valley_threshold_factor = 1.00
         self.recent_frequencies = []  
         self.hysteresis = 0.2
         self.hysteresis_multiplier = 1.5
         self.waiting_for_valley = False
+        self.hysteresis_start_time = 0
+        
+        # Bass level tracking for peak validation
+        self.bass_levels = []  # Stores bass levels when valid peaks are detected
+        self.bass_window_size = 10  # Number of bass levels to keep for average
+        
+        # Peak timing tracking
+        self.peak_timestamps = []  # Stores timestamps of valid peaks
+        self.peak_interval_window_size = 5  # Number of intervals to average
+        self.early_peak_threshold = 1.25  # 15% above normal for early peaks (configurable)
+        self.timing_buffer = 0.100  # 100ms buffer before expected peak (configurable)
+
+        # Variáveis para controle de limpeza do histórico
+        self.last_audio_time = time.time()  # Timestamp da última recepção de áudio significativo
+        self.silence_threshold = 0.5  # 0.5 segundos de silêncio
+        self.bass_cleaned = False  # Flag para evitar limpeza repetida
+        self.silence_volume_threshold = 0.01  # Threshold mínimo para considerar como "áudio real"
+
+        # Audio monitoring control
+        self.audio_running = True
 
         # Graphical interface
         self.setup_initial_interface()
@@ -218,7 +238,7 @@ class ImageViewer:
             spine.set_visible(False)
         self.ax.set_ylim(-1, 1)
         self.ax.set_xlim(0, self.blocksize)
-        self.line, = self.ax.plot([], [], lw=2, color='red')
+        self.line, = self.ax.plot(np.arange(self.blocksize), np.zeros(self.blocksize), lw=2, color='lime')
         self.canvas_graph = FigureCanvasTkAgg(self.fig, master=frame)  
         self.canvas_graph.draw()
         self.canvas_graph.get_tk_widget().config(bg='black')
@@ -226,7 +246,7 @@ class ImageViewer:
 
         # Log box below the graph
         self.log_text = tk.Text(frame, height=10, width=40, bg="white", fg="black")
-        self.log_text.pack(pady=5, expand=True, fill=tk.BOTH)  # Removido 'side=tk.RIGHT', agora está abaixo
+        self.log_text.pack(pady=5, expand=True, fill=tk.BOTH)
 
         # Redirect prints to the log box
         sys.stdout = TextRedirector(self.log_text)
@@ -274,82 +294,324 @@ class ImageViewer:
         """Thread principal de captura e análise de áudio"""
         pythoncom.CoInitialize()
         
+        # Inicia o monitor de silêncio na thread principal
+        self.root.after(100, self.check_audio_silence)
+        
         try:
+            # Usa soundcard para capturar áudio do sistema (loopback)
+            speaker = sc.default_speaker()
+            
+            # Usa uma versão mais robusta do sounddevice para loopback
+            # Lista dispositivos disponíveis para encontrar o loopback
+            devices = sd.query_devices()
+            loopback_device = None
+            
+            for i, device in enumerate(devices):
+                if 'loopback' in device['name'].lower() or 'stereo mix' in device['name'].lower():
+                    loopback_device = i
+                    break
+            
+            if loopback_device is not None:
+                print(f"Usando dispositivo loopback: {devices[loopback_device]['name']}")
+                
+                def audio_callback(indata, frames, time, status):
+                    if status:
+                        print(f"Audio status: {status}")
+                    self.process_audio_data(indata)
+                
+                with sd.InputStream(callback=audio_callback, 
+                                  device=loopback_device,
+                                  channels=1, 
+                                  samplerate=self.samplerate, 
+                                  blocksize=self.blocksize):
+                    print("Audio monitoring started...")
+                    while self.audio_running:
+                        time.sleep(0.1)
+            else:
+                # Fallback para soundcard se não encontrar dispositivo loopback
+                print("Dispositivo loopback não encontrado, usando soundcard...")
+                self.fallback_soundcard_audio()
+                    
+        except Exception as e:
+            print(f"Error: on audio {e}")
+            # Tenta fallback para soundcard
+            self.fallback_soundcard_audio()
+        finally:
+            pythoncom.CoUninitialize()
+
+    def fallback_soundcard_audio(self):
+        """Fallback usando soundcard para capturar áudio do sistema"""
+        try:
+            # Patch temporário para numpy compatibility
+            import soundcard.mediafoundation
+            original_fromstring = np.fromstring
+            
+            def patched_fromstring(string, dtype, **kwargs):
+                if hasattr(string, 'raw'):
+                    return np.frombuffer(string.raw, dtype=dtype, **kwargs)
+                else:
+                    return np.frombuffer(string, dtype=dtype, **kwargs)
+            
+            np.fromstring = patched_fromstring
+            
             speaker = sc.default_speaker()
             mic = sc.get_microphone(speaker.name, include_loopback=True)
             
             with mic.recorder(samplerate=self.samplerate) as mic_stream:
-                print("Audio monitoring started...")
+                print("Audio monitoring started with soundcard...")
                 
-                while True:
-                    data = mic_stream.record(numframes=self.blocksize)
-                    self.process_audio_data(data)
-                    
+                while self.audio_running:
+                    try:
+                        data = mic_stream.record(numframes=self.blocksize)
+                        self.process_audio_data(data)
+                    except Exception as e:
+                        print(f"Erro na captura: {e}")
+                        time.sleep(0.1)
+                        
         except Exception as e:
-            print(f"Error: on audio {e}")
-            self.exit_viewer()
+            print(f"Erro no soundcard fallback: {e}")
         finally:
-            pythoncom.CoUninitialize()
+            # Restaura o método original
+            np.fromstring = original_fromstring
 
     def process_audio_data(self, data):
         """Processa os dados de áudio capturados"""
-        raw_volume = np.sqrt(np.mean(data.astype(float)**2))
-        self.volume_window.append(raw_volume)
+        try:
+            # Fix for numpy compatibility
+            data = np.asarray(data, dtype=np.float32)
+            if data.ndim > 1:
+                data = data.flatten()
+            
+            raw_volume = np.sqrt(np.mean(data**2))
+            
+            # Só atualiza last_audio_time se o volume for significativo (não é silêncio)
+            current_time = time.time()
+            if raw_volume > self.silence_volume_threshold:
+                self.last_audio_time = current_time
+                
+                # Se estava em silêncio e agora recebeu áudio significativo, resetar flag de limpeza
+                if self.bass_cleaned:
+                    self.bass_cleaned = False
+                    print("🔊 Áudio significativo detectado novamente - Flag de limpeza resetada")
+            
+            self.volume_window.append(raw_volume)
 
-        if len(self.volume_window) > self.window_size:
-            self.volume_window.pop(0)
+            if len(self.volume_window) > self.window_size:
+                self.volume_window.pop(0)
 
-        dominant_freq = self.analyze_frequencies(data)
-        self.recent_frequencies.append(dominant_freq)
-        if len(self.recent_frequencies) > self.window_size:
-            self.recent_frequencies.pop(0)
+            dominant_freq = self.analyze_frequencies(data)
+            self.recent_frequencies.append(dominant_freq)
+            if len(self.recent_frequencies) > self.window_size:
+                self.recent_frequencies.pop(0)
 
-        self.update_visualization(data.astype(float).flatten())
+            # Analyze bass level for this audio chunk
+            bass_level = self.analyze_bass_level(data)
 
-        if len(self.volume_window) == self.window_size:
-            self.dynamic_detection()
+            # Schedule visualization update on main thread
+            self.root.after_idle(lambda: self.update_visualization(data))
+
+            if len(self.volume_window) == self.window_size:
+                self.dynamic_detection(bass_level)
+                
+        except Exception as e:
+            print(f"Erro no processamento de áudio: {e}")
+
+    def check_audio_silence(self):
+        """Verifica se houve silêncio por mais de 0.5s e limpa histórico se necessário"""
+        try:
+            current_time = time.time()
+            time_since_last_audio = current_time - self.last_audio_time
+            
+            # Se passou do threshold de silêncio E ainda não limpou
+            if time_since_last_audio > self.silence_threshold and not self.bass_cleaned:
+                if len(self.bass_levels) > 0:
+                    print(f"🧹 Silêncio detectado por {time_since_last_audio:.2f}s - Limpando histórico de {len(self.bass_levels)} níveis de grave")
+                    self.bass_levels.clear()
+                    # Também limpa os timestamps para reset completo
+                    self.peak_timestamps.clear()
+                    self.bass_cleaned = True
+                    print("🔄 Histórico de timing também limpo - Sistema resetado")
+                else:
+                    # Marca como limpo mesmo se não havia dados
+                    self.bass_cleaned = True
+                    
+        except Exception as e:
+            print(f"Erro na verificação de silêncio: {e}")
+        
+        # Agenda próxima verificação em 100ms
+        if self.audio_running:
+            self.root.after(100, self.check_audio_silence)
 
     def analyze_frequencies(self, audio_data):
         """Aplica FFT no áudio e retorna a frequência dominante"""
-        fft_result = np.fft.fft(audio_data.flatten())
-        freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
-        magnitude = np.abs(fft_result)
-        dominant_freq = freqs[np.argmax(magnitude)]
-        return abs(dominant_freq)
+        try:
+            if len(audio_data) < 2:
+                return 0.0
+                
+            fft_result = np.fft.fft(audio_data)
+            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
+            magnitude = np.abs(fft_result)
+            
+            # Ignora frequência DC (0 Hz)
+            magnitude[0] = 0
+            
+            if len(magnitude) == 0:
+                return 0.0
+                
+            dominant_freq = freqs[np.argmax(magnitude)]
+            return abs(dominant_freq)
+        except Exception as e:
+            print(f"Erro na análise de frequência: {e}")
+            return 0.0
+
+    def analyze_bass_level(self, audio_data):
+        """Analisa o nível de graves no áudio (frequências baixas 20-250 Hz)"""
+        try:
+            if len(audio_data) < 2:
+                return 0.0
+                
+            fft_result = np.fft.fft(audio_data)
+            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
+            magnitude = np.abs(fft_result)
+            
+            # Define range de frequências graves (20-250 Hz)
+            bass_mask = (np.abs(freqs) >= 20) & (np.abs(freqs) <= 250)
+            
+            if np.any(bass_mask):
+                bass_magnitude = magnitude[bass_mask]
+                bass_level = np.mean(bass_magnitude)
+                return bass_level
+            else:
+                return 0.0
+                
+        except Exception as e:
+            print(f"Erro na análise de graves: {e}")
+            return 0.0
         
-    def dynamic_detection(self):
-        """Modifica a lógica de detecção de som com base na média das últimas frequências"""
+    def dynamic_detection(self, current_bass_level):
+        """Modifica a lógica de detecção de som com validação de graves e timing"""
         if len(self.recent_frequencies) == 0:
             return
 
-        baseline = np.percentile(self.volume_window, 70)
-        valley_base = np.percentile(self.volume_window, 30)
-        peak_threshold = baseline * self.volume_threshold_factor
-        valley_threshold = valley_base * self.valley_threshold_factor
-        current_volume = self.volume_window[-1]
+        try:
+            baseline = np.percentile(self.volume_window, 70)
+            valley_base = np.percentile(self.volume_window, 30)
+            peak_threshold = baseline * self.volume_threshold_factor
+            valley_threshold = valley_base * self.valley_threshold_factor
+            current_volume = self.volume_window[-1]
+            current_time = time.time()
 
-        avg_frequency = np.mean(self.recent_frequencies)
+            avg_frequency = np.mean(self.recent_frequencies)
 
-        if self.waiting_for_valley and (time.time() - self.hysteresis_start_time) < self.hysteresis:
-            peak_threshold *= self.hysteresis_multiplier
+            if hasattr(self, 'waiting_for_valley') and self.waiting_for_valley and hasattr(self, 'hysteresis_start_time') and (current_time - self.hysteresis_start_time) < self.hysteresis:
+                peak_threshold *= self.hysteresis_multiplier
 
-        if current_volume > peak_threshold:
-            if not self.waiting_for_valley:
-                print(f"🔄 Frequência: {avg_frequency:.2f} Hz")
-                for player in self.players:
-                    if player.running:  
-                        player.next_image()
-                self.waiting_for_valley = True
-                self.hysteresis_start_time = time.time()
+            # Check if current volume exceeds threshold
+            if current_volume > peak_threshold:
+                if not hasattr(self, 'waiting_for_valley') or not self.waiting_for_valley:
+                    
+                    # Validate peak using bass level average
+                    is_valid_peak = True
+                    
+                    if len(self.bass_levels) > 0:
+                        # Calculate average bass level from previous valid peaks
+                        avg_bass_level = np.mean(self.bass_levels)
+                        
+                        # Peak is valid if bass level is sufficient
+                        if current_bass_level < (avg_bass_level * 0.5):  # Bass too low
+                            is_valid_peak = False
+                            print(f"❌ Falso pico detectado - Grave muito baixo: {current_bass_level:.4f} (média: {avg_bass_level:.4f})")
+                    
+                    # Check peak timing if we have previous peaks
+                    if is_valid_peak and len(self.peak_timestamps) > 0:
+                        time_since_last_peak = current_time - self.peak_timestamps[-1]
+                        
+                        # Calculate average interval between peaks
+                        if len(self.peak_timestamps) >= 2:
+                            intervals = []
+                            for i in range(1, min(len(self.peak_timestamps), self.peak_interval_window_size + 1)):
+                                interval = self.peak_timestamps[-i] - self.peak_timestamps[-i-1]
+                                intervals.append(interval)
+                            
+                            avg_interval = np.mean(intervals)
+                            # Apply timing buffer - expect peak 100ms earlier than average
+                            expected_time = avg_interval - self.timing_buffer
+                            
+                            # If peak is coming too early (before expected time), require higher threshold
+                            if time_since_last_peak < expected_time:
+                                required_threshold = peak_threshold * self.early_peak_threshold
+                                if current_volume < required_threshold:
+                                    is_valid_peak = False
+                                    print(f"❌ Pico muito cedo - Requer {self.early_peak_threshold:.0%} acima do normal.")
+                                    print(f"   Intervalo atual: {time_since_last_peak:.3f}s, Esperado: {expected_time:.3f}s (média: {avg_interval:.3f}s - buffer: {self.timing_buffer:.3f}s)")
+                                    print(f"   Volume atual: {current_volume:.4f}, Necessário: {required_threshold:.4f}")
+                                else:
+                                    print(f"✅ Pico cedo mas forte o suficiente: {current_volume:.4f} ≥ {required_threshold:.4f}")
+                            else:
+                                print(f"⏰ Pico no timing esperado: {time_since_last_peak:.3f}s ≥ {expected_time:.3f}s")
+                    
+                    if is_valid_peak:
+                        # Record bass level and timestamp for this valid peak
+                        self.bass_levels.append(current_bass_level)
+                        if len(self.bass_levels) > self.bass_window_size:
+                            self.bass_levels.pop(0)
+                        
+                        self.peak_timestamps.append(current_time)
+                        if len(self.peak_timestamps) > self.peak_interval_window_size:
+                            self.peak_timestamps.pop(0)
+                        
+                        avg_bass = np.mean(self.bass_levels) if len(self.bass_levels) > 0 else current_bass_level
+                        
+                        if len(self.peak_timestamps) >= 2:
+                            last_interval = self.peak_timestamps[-1] - self.peak_timestamps[-2]
+                            # Calculate current average for display
+                            intervals = []
+                            for i in range(1, min(len(self.peak_timestamps), self.peak_interval_window_size + 1)):
+                                interval = self.peak_timestamps[-i] - self.peak_timestamps[-i-1]
+                                intervals.append(interval)
+                            current_avg_interval = np.mean(intervals)
+                            
+                            print(f"🔄 Pico válido - Freq: {avg_frequency:.2f} Hz | Volume: {current_volume:.4f} | Grave: {current_bass_level:.4f} (média: {avg_bass:.4f})")
+                            print(f"   Intervalo: {last_interval:.3f}s | Média de intervalos: {current_avg_interval:.3f}s")
+                        else:
+                            print(f"🔄 Pico válido - Freq: {avg_frequency:.2f} Hz | Volume: {current_volume:.4f} | Grave: {current_bass_level:.4f} (média: {avg_bass:.4f})")
+                        
+                        for player in self.players:
+                            if player.running:  
+                                player.next_image()
+                                
+                        self.waiting_for_valley = True
+                        self.hysteresis_start_time = current_time
 
-        elif current_volume < valley_threshold:
-            self.waiting_for_valley = False
+            elif current_volume < valley_threshold:
+                self.waiting_for_valley = False
+        except Exception as e:
+            print(f"Erro na detecção: {e}")
                 
     def update_visualization(self, data):
         """Atualiza a visualização da forma de onda"""
-        self.line.set_ydata(data)
-        self.line.set_xdata(np.arange(len(data)))
-        self.canvas_graph.draw()        
+        try:
+            if hasattr(self, 'line') and len(data) > 0:
+                # Normaliza os dados para melhor visualização
+                normalized_data = data / (np.max(np.abs(data)) + 1e-10)
+                
+                # Limita o tamanho dos dados para a visualização
+                if len(normalized_data) > self.blocksize:
+                    normalized_data = normalized_data[:self.blocksize]
+                elif len(normalized_data) < self.blocksize:
+                    # Pad with zeros if needed
+                    padded_data = np.zeros(self.blocksize)
+                    padded_data[:len(normalized_data)] = normalized_data
+                    normalized_data = padded_data
+                
+                self.line.set_ydata(normalized_data)
+                self.line.set_xdata(np.arange(len(normalized_data)))
+                
+                # Force canvas update
+                self.canvas_graph.draw_idle()
+                
+        except Exception as e:
+            print(f"Erro na visualização: {e}")
 
     def update_threshold_factor(self, value):
         self.volume_threshold_factor = float(value)
@@ -361,13 +623,12 @@ class ImageViewer:
         """Fecha todos os players, encerra as threads e finaliza o programa de forma segura."""
         print("Exiting...")
 
+        # Para o monitoramento de áudio
+        self.audio_running = False
+
         # Closes all players
         for player in self.players:
             player.on_close()
-
-        # Waits for the audio thread to finish before closing
-        if self.audio_thread.is_alive():
-            self.audio_thread.join(timeout=1)  
 
         # Closes the graphical interface
         self.root.quit()  
