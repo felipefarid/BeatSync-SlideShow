@@ -924,7 +924,7 @@ class ImageViewer:
                             
                             # Ignora médias acima de 1 segundo
                             if avg_interval > 1.0:
-                                print(f"⚠️ Média de intervalo muito alta ({avg_interval:.3f}s), ignorando validação de timing")
+                                print(f"⚠️ Média de ({avg_interval:.3f}s),")
                             else:
                                 # Apply timing buffer - expect peak 100ms earlier than average
                                 expected_time = avg_interval - self.timing_buffer
