@@ -1,11 +1,14 @@
+#!/usr/bin/env python3
+# Song_Slide - Final High IQ (Threaded + Advanced Audio Logic + Rhythmic Sensitivity Fix) - MÁXIMA PERFORMANCE (BUFFER DE 5)
+# FIX CRÍTICO: Uso de update_idletasks() para garantir dimensões do canvas antes do carregamento da primeira imagem.
+
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox, filedialog
 from PIL import Image, ImageTk
 import os
 import numpy as np
 import threading
 import time
-import sounddevice as sd
 import soundcard as sc
 import random
 import warnings
@@ -13,35 +16,468 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import pythoncom
 import sys
+import queue
 
-# Settings to suppress warnings
+# -------------------------------------------------------------------
+# Configurações de Áudio e UI
+# -------------------------------------------------------------------
+SAMPLERATE = 48000
+BLOCKSIZE = 1536
+AUDIO_QUEUE_MAX = 8          
+RESULT_QUEUE_MAX = 64         
+PROCESSOR_SLEEP_ON_EMPTY = 0.005 
+CAPTURE_REOPEN_BACKOFF = 0.5  
+MAX_CAPTURE_REOPEN = 5        
+VIZ_UPDATE_MS = 25 
+
+# TAMANHO DO BUFFER DE PRÉ-CARREGAMENTO
+PRELOAD_BUFFER_SIZE = 5 
+
+# Faixas reais de processamento de áudio (em Hz)
+FREQ_BANDS = [
+    (20, 100), (100, 150), (150, 250), (250, 500), (500, 1000),
+    (1000, 2000), (2000, 4000), (4000, 8000), (8000, 12000), (12000, 20000)
+]
+
+# -------------------------
+# Thread-safe queues/state
+# -------------------------
+audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_MAX)
+beat_detection_queue = queue.Queue(maxsize=RESULT_QUEUE_MAX)
+shared_lock = threading.Lock()
+shared_state = {
+    "bar_heights": [0.0] * len(FREQ_BANDS),
+    "peak_heights": [0.0] * len(FREQ_BANDS),
+    "vu_updated": False,
+    "last_fft_time": None,
+}
+
 warnings.filterwarnings("ignore", category=UserWarning)
-from soundcard import SoundcardRuntimeWarning
-warnings.filterwarnings("ignore", category=SoundcardRuntimeWarning)
+try:
+    from soundcard import SoundcardRuntimeWarning 
+    warnings.filterwarnings("ignore", category=SoundcardRuntimeWarning) 
+except Exception:
+    pass
+
+# -------------------------
+# Utilities
+# -------------------------
+def safe_put(q: queue.Queue, item):
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            _ = q.get_nowait()
+            q.put_nowait(item)
+        except Exception:
+            pass
+
+def clear_queue(q: queue.Queue):
+    """Esvazia a fila de forma segura."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
 
 class TextRedirector:
-    """Redirects prints to a Tkinter widget"""
     def __init__(self, text_widget):
         self.text_widget = text_widget
-
     def write(self, message):
-        self.text_widget.insert(tk.END, message)
-        self.text_widget.see(tk.END) # Auto-scroll to the last line
-
+        try:
+            self.text_widget.after(0, self._insert_text, str(message))
+        except Exception:
+            pass
+    def _insert_text(self, message):
+        try:
+            self.text_widget.insert(tk.END, message)
+            self.text_widget.see(tk.END)
+            lines = int(self.text_widget.index('end-1c').split('.')[0])
+            if lines > 1000:
+                self.text_widget.delete('1.0', '500.0')
+        except Exception:
+            pass
     def flush(self):
-        pass  # Required for compatibility with standard stdout
+        pass
 
+# -------------------------
+# ThreadCapture
+# -------------------------
+class ThreadCapture(threading.Thread):
+    def __init__(self, samplerate=SAMPLERATE, blocksize=BLOCKSIZE, stop_event=None):
+        super().__init__(daemon=True)
+        self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.stop_event = stop_event or threading.Event()
+
+    def run(self):
+        pythoncom.CoInitialize()
+        try:
+            original_fromstring = getattr(np, "fromstring", None)
+            patched = False
+            try:
+                def patched_fromstring(string, dtype=float, **kwargs):
+                    if hasattr(string, "raw"):
+                        return np.frombuffer(string.raw, dtype=dtype, **kwargs)
+                    else:
+                        return np.frombuffer(string, dtype=dtype, **kwargs)
+                if original_fromstring is not None:
+                    np.fromstring = patched_fromstring
+                    patched = True
+            except Exception:
+                patched = False
+
+            reopen_attempts = 0
+            while not self.stop_event.is_set():
+                try:
+                    speaker = sc.default_speaker()
+                    mic = sc.get_microphone(speaker.name, include_loopback=True)
+             
+                    with mic.recorder(samplerate=self.samplerate, blocksize=self.blocksize) as rec:
+                        print(f"[Soundcard] Captura de áudio iniciada: {speaker.name}")
+                        reopen_attempts = 0
+                        while not self.stop_event.is_set():
+                            try:
+                                data = rec.record(numframes=self.blocksize)
+                                safe_put(audio_queue, np.array(data, copy=True))
+                            except Exception as e:
+                                print(f"[Soundcard] erro record: {e}")
+                                time.sleep(0.05)
+                                break
+                except Exception as e:
+                    reopen_attempts += 1
+                    print(f"[Soundcard] erro ao abrir recorder/loopback: {e} (attempt {reopen_attempts})")
+                    if reopen_attempts <= MAX_CAPTURE_REOPEN:
+                        time.sleep(CAPTURE_REOPEN_BACKOFF)
+                    else:
+                        time.sleep(CAPTURE_REOPEN_BACKOFF * 4)
+                    continue
+                finally:
+                    if patched and original_fromstring is not None:
+                        try:
+                            np.fromstring = original_fromstring
+                        except Exception:
+                            pass
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+# -------------------------
+# ThreadProcessor
+# -------------------------
+class ThreadProcessor(threading.Thread):
+    def __init__(self, samplerate=SAMPLERATE, blocksize=BLOCKSIZE, freq_bands=FREQ_BANDS, stop_event=None):
+        super().__init__(daemon=True)
+        self.samplerate = samplerate
+        self.blocksize = blocksize
+        self.freq_bands = freq_bands
+        self.stop_event = stop_event or threading.Event()
+        
+        # Configurações VU Meter
+        self.decay_rate = 0.85 
+        self.peak_decay_rate = 0.995 
+        self.peak_hold_frames = 20 
+        self.bar_heights = [0.0] * len(self.freq_bands)
+        self.peak_heights = [0.0] * len(self.freq_bands)
+        self.peak_hold_time = [0] * len(self.freq_bands)
+        
+        # --- LÓGICA AVANÇADA DE DETECÇÃO ---
+        self.volume_window = [] 
+        self.window_size = 10 
+        self.volume_threshold_factor = 1.00 
+        self.valley_threshold_factor = 1.00 
+        self.recent_frequencies = []  
+        
+        # Histerese
+        self.hysteresis = 0.2        
+        self.hysteresis_multiplier = 1.5 
+        self.waiting_for_valley = False
+        self.hysteresis_start_time = 0
+        
+        self.bass_levels = []
+        self.bass_window_size = 10
+        
+        self.peak_timestamps = [] 
+        self.peak_interval_window_size = 5
+        self.timing_buffer = 0.130
+        
+        self.default_interval = 0.2 
+        self.dynamic_threshold_max = 1.90 
+        self.non_bass_override_factor = 1.60 
+
+        self.main_timing_list = [] 
+
+        self.last_audio_time = time.time()
+        self.silence_threshold = 0.5
+        self.bass_cleaned = False
+        self.silence_volume_threshold = 0.01
+
+    def run(self):
+        print("[Processor] Thread de processamento iniciada (Lógica Simplificada)") 
+        print("⏳ Aguardando 5 segundos para Player estabilizar...")
+        time.sleep(5.0) 
+        print("✅ Atraso inicial de 5 segundos concluído. Iniciando processamento de áudio.")
+        frame_count = 0
+        
+        self.initialize_default_timing()
+        
+        while not self.stop_event.is_set():
+            try:
+                try:
+                    raw = audio_queue.get(timeout=0.2) 
+                    frame_count += 1
+                except queue.Empty:
+                    time.sleep(PROCESSOR_SLEEP_ON_EMPTY)
+                    continue
+
+                data = np.asarray(raw, dtype=np.float32) 
+                if data.ndim > 1:
+                    data = data.mean(axis=1)
+
+                if data.size == 0:
+                    continue
+
+                # VU Meter (Visual)
+                fft_result = np.fft.rfft(data) 
+                freqs = np.fft.rfftfreq(len(data), d=1.0 / self.samplerate) 
+                magnitude = np.abs(fft_result) 
+
+                band_energies = []
+                for (lo, hi) in self.freq_bands:
+                    mask = (freqs >= lo) & (freqs < hi) 
+                    if np.any(mask):
+                        e = float(np.mean(magnitude[mask])) 
+                    else:
+                        e = 0.0 
+                    band_energies.append(e)
+
+                max_energy = max(band_energies) if band_energies else 1.0
+                if max_energy <= 0: max_energy = 1.0
+                new_heights = [min(1.0, e / max_energy) for e in band_energies] 
+
+                for i in range(len(self.bar_heights)):
+                    self.bar_heights[i] = max(new_heights[i], self.bar_heights[i] * self.decay_rate) 
+                    if self.bar_heights[i] > self.peak_heights[i]:
+                        self.peak_heights[i] = self.bar_heights[i] 
+                        self.peak_hold_time[i] = self.peak_hold_frames 
+                    else:
+                        if self.peak_hold_time[i] > 0:
+                            self.peak_hold_time[i] -= 1 
+                        else:
+                            self.peak_heights[i] *= self.peak_decay_rate 
+
+                with shared_lock:
+                    shared_state["bar_heights"] = list(self.bar_heights) 
+                    shared_state["peak_heights"] = list(self.peak_heights) 
+                    shared_state["vu_updated"] = True 
+                    shared_state["last_fft_time"] = time.time() 
+
+                # Processamento de Lógica
+                self.process_beat_detection(data)
+           
+                # Verificação de silêncio
+                current_time = time.time()
+                if (current_time - self.last_audio_time) > self.silence_threshold and not self.bass_cleaned:
+                    if len(self.bass_levels) > 0:
+                        print(f"🧹 Silêncio detectado - Limpando buffer e histórico") 
+                        
+                        clear_queue(audio_queue) 
+                        
+                        self.reset_timing_history()
+                        self.bass_cleaned = True
+
+            except Exception as e:
+                print(f"[Processor] error: {e}") 
+
+    def process_beat_detection(self, audio_data):
+        try:
+            data = np.asarray(audio_data, dtype=np.float32)
+            if data.ndim > 1: data = data.flatten()
+
+            raw_volume = np.sqrt(np.mean(data**2))
+            current_time = time.time()
+         
+            if raw_volume > self.silence_volume_threshold: 
+                self.last_audio_time = current_time
+                if self.bass_cleaned:
+                    self.bass_cleaned = False
+            
+            self.volume_window.append(raw_volume) 
+ 
+            if len(self.volume_window) > self.window_size: 
+                self.volume_window.pop(0)
+
+            bass_level = self.analyze_bass_level(data)
+            self.recent_frequencies.append(self.analyze_frequencies(data))
+            if len(self.recent_frequencies) > self.window_size:
+                self.recent_frequencies.pop(0)
+
+            if len(self.volume_window) == self.window_size and raw_volume > self.silence_volume_threshold: 
+                self.dynamic_detection(bass_level, raw_volume, current_time)
+            
+        except Exception as e:
+            print(f"Erro process_beat: {e}")
+
+    def analyze_frequencies(self, audio_data):
+        try:
+            if len(audio_data) < 2: return 0.0
+        
+            fft_result = np.fft.fft(audio_data) 
+            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate) 
+            magnitude = np.abs(fft_result) 
+            magnitude[0] = 0
+            if len(magnitude) == 0: return 0.0
+            dominant_freq = freqs[np.argmax(magnitude)] 
+            return abs(dominant_freq)
+       
+        except: return 0.0 
+
+    def analyze_bass_level(self, audio_data):
+        return self._analyze_frequency_band(audio_data, 10, 110)
+
+    def _analyze_frequency_band(self, audio_data, min_freq, max_freq):
+        try:
+            if len(audio_data) < 2: return 0.0
+            
+            fft_result = np.fft.fft(audio_data)
+            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
+      
+            magnitude = np.abs(fft_result) 
+            freq_mask = (np.abs(freqs) >= min_freq) & (np.abs(freqs) <= max_freq) 
+            
+            if np.any(freq_mask):
+                band_energy = np.sum(magnitude[freq_mask]**2)
+                num_bins = np.sum(freq_mask)
+           
+                if num_bins > 0: return band_energy / num_bins 
+                return band_energy
+            return 0.0
+        except: return 0.0
+
+    def calculate_list_avg(self, timing_list):
+        if len(timing_list) < 2: return self.default_interval
+        intervals = [timing_list[i] - timing_list[i-1] for i in range(1, len(timing_list))] 
+        return np.mean(intervals) if intervals else self.default_interval
+
+    def dynamic_detection(self, current_bass_level, current_volume, current_time):
+        try:
+            baseline = np.percentile(self.volume_window, 70)
+            valley_base = np.percentile(self.volume_window, 30)
+  
+            peak_threshold = baseline * self.volume_threshold_factor 
+            valley_threshold = valley_base * self.valley_threshold_factor 
+            
+            if self.waiting_for_valley and (current_time - self.hysteresis_start_time) < self.hysteresis:
+                peak_threshold *= self.hysteresis_multiplier 
+
+            if current_volume > peak_threshold:
+                if not self.waiting_for_valley:
+                    is_valid_peak = True
+                    
+                    if len(self.bass_levels) > 0: 
+                        avg_bass_level = np.mean(self.bass_levels) 
+                  
+                        if current_bass_level < (avg_bass_level * 0.5): 
+                            override_threshold = baseline * self.non_bass_override_factor 
+
+                            if current_volume < override_threshold:
+                                is_valid_peak = False 
+                            
+                    else:
+                        if current_bass_level < 0.001:
+                            is_valid_peak = False 
+
+                    current_timing_list = self.main_timing_list 
+
+                    if is_valid_peak and len(current_timing_list) > 0: 
+                        time_since_last_peak = current_time - current_timing_list[-1]
+
+                        if len(current_timing_list) >= 2:
+                            intervals = [current_timing_list[i] - current_timing_list[i-1] 
+                                         for i in range(1, len(current_timing_list))] 
+                            avg_interval = np.mean(intervals)
+
+                            if avg_interval <= 1.0:
+                                expected_time = avg_interval - self.timing_buffer 
+                                if time_since_last_peak < expected_time:
+                                    time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0 
+                                    time_ratio = np.clip(time_ratio, 0.0, 1.0) 
+                                    
+                                    dynamic_threshold = self.dynamic_threshold_max - (0.50 * time_ratio) 
+                                    required_threshold = peak_threshold * dynamic_threshold
+
+                                    if current_volume < required_threshold:
+                                        is_valid_peak = False 
+
+                    if is_valid_peak:
+                        self.bass_levels.append(current_bass_level) 
+                        if len(self.bass_levels) > self.bass_window_size: self.bass_levels.pop(0)
+
+                        self.peak_timestamps.append(current_time) 
+                        if len(self.peak_timestamps) > 20: self.peak_timestamps.pop(0)
+
+                        self.update_timing_lists(current_time) 
+
+                        avg_time_ms = self.calculate_list_avg(self.main_timing_list) * 1000
+                        
+                        # Dispara ação
+                        safe_put(beat_detection_queue, {"action": "change_image"}) 
+                        
+                        avg_freq = np.mean(self.recent_frequencies) if self.recent_frequencies else 0
+                        print(f"🎵 Batida! | Freq: {avg_freq:.0f}Hz | Média Intervalo: {avg_time_ms:.2f}ms")
+
+                        self.waiting_for_valley = True
+                        self.hysteresis_start_time = current_time
+
+            elif current_volume < valley_threshold:
+                self.waiting_for_valley = False
+        except Exception as e: 
+            print(f"Erro dynamic_detection: {e}")
+
+    def update_timing_lists(self, current_time):
+        if len(self.peak_timestamps) < 2: return
+        self.main_timing_list = self.peak_timestamps[-10:] if len(self.peak_timestamps) >= 10 else self.peak_timestamps.copy() 
+    
+    def initialize_default_timing(self):
+        current_time = time.time() 
+        self.peak_timestamps = []
+        self.main_timing_list = []
+        for i in range(3):
+            ts = current_time - (3 - i) * self.default_interval
+            self.peak_timestamps.append(ts)
+            self.main_timing_list.append(ts)
+        
+    def reset_timing_history(self):
+        self.bass_levels.clear() 
+        self.peak_timestamps.clear() 
+        self.main_timing_list.clear() 
+        self.initialize_default_timing() 
+
+
+# -------------------------
+# Player class
+# -------------------------
 class Player:
-    def __init__(self, root, image_paths, random_order):
+    def __init__(self, root, image_paths, random_order=True):
         self.root = root
         self.image_paths = image_paths
         self.random_order = random_order
         self.image_index = 0
         self.running = True
-        self.current_image = None  # Armazena a imagem atual para enquadramentos
-        self.current_frame_type = "normal"  # Tipo de enquadramento atual
+        
+        # ESSENCIAL: Armazena a referência da imagem *atualmente* exibida.
+        self.tk_image = None
+        
+        # Estado e Lock para gerenciamento do buffer de pré-carregamento
+        self.image_load_lock = threading.Lock()
+        # {índice: (tk_image, display_width, display_height)}
+        self.preloaded_images = {} 
+        # Índices que estão atualmente sendo carregados por threads
+        self.loading_indices = set() 
 
-        # Create a new window for the player
         self.viewer_window = tk.Toplevel(self.root)
         self.viewer_window.title("Player")
         self.viewer_window.geometry("800x600")
@@ -49,1134 +485,493 @@ class Player:
         self.canvas = tk.Canvas(self.viewer_window, bg="black")
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Configure the window close event
         self.viewer_window.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Inicia o primeiro carregamento após a UI estar pronta
+        self.root.after_idle(self.initial_load)
 
-        # Display the first image
-        self.show_image()
-
-    def show_image(self, attempt=1):
-        """Exibe a imagem atual na tela com tratamento de erros reforçado"""
-        if not self.image_paths or attempt > 5:
-            print("Error: Can't load images")
-            return
-
+    def _preload_image_in_background(self, index, path, cw, ch):
+        """Função pesada: Carrega e redimensiona a imagem PIL (executada em thread)."""
         try:
-            # Carrega a imagem original
-            self.current_image = Image.open(self.image_paths[self.image_index])
+            # 1. Carregamento e redimensionamento (Thread-safe)
+            current_image = Image.open(path)
+            display_img = self.resize_image(current_image, cw, ch)
             
-            # Wait until the canvas has valid dimensions (up to 1 second)
-            timeout = time.time() + 1.0  # 1-second timeout
-            while True:
-                self.viewer_window.update()  # Force a complete window update
-                canvas_width = self.canvas.winfo_width()
-                canvas_height = self.canvas.winfo_height()
-                if canvas_width > 0 and canvas_height > 0:
-                    break
-                if time.time() > timeout:
-                    print("Error: canvas")
-                    return
-                time.sleep(0.05)
+            # 2. Agenda a atualização do buffer na thread principal
+            self.root.after_idle(lambda: self._store_preloaded_pil_data(display_img, display_img.width, display_img.height, index))
+        except Exception as e:
+            print(f"Error pre-loading image {index}: {e}")
+            with self.image_load_lock:
+                if index in self.loading_indices:
+                    self.loading_indices.remove(index)
+            self.root.after_idle(self.refill_preload_buffer)
+
+    def _store_preloaded_pil_data(self, pil_image, dw, dh, index_loaded):
+        """Armazena o objeto PIL Image (executado na thread principal), convertendo para PhotoImage."""
+        try:
+            # CRIAÇÃO DO ImageTk.PhotoImage na thread principal (segurança máxima)
+            tk_image = ImageTk.PhotoImage(pil_image) 
             
-            # Aplica o enquadramento atual (normal por padrão)
-            display_img = self.apply_framing(self.current_image, canvas_width, canvas_height)
-            self.tk_image = ImageTk.PhotoImage(display_img)
+            with self.image_load_lock:
+                # Armazena o objeto pronto para exibição (tk_image)
+                self.preloaded_images[index_loaded] = (tk_image, dw, dh)
+                if index_loaded in self.loading_indices:
+                    self.loading_indices.remove(index_loaded)
+            
+        except Exception as e:
+            print(f"Erro ao criar PhotoImage para índice {index_loaded}: {e}")
+            with self.image_load_lock:
+                if index_loaded in self.loading_indices:
+                    self.loading_indices.remove(index_loaded)
+        
+        self.root.after_idle(self.refill_preload_buffer) 
+        
+    def _update_canvas_display(self, tk_image, dw, dh, cw, ch):
+        """Atualiza o canvas com uma imagem TK já pronta (SÓ NA THREAD PRINCIPAL)."""
+        try:
+            # CRÍTICO: Armazena a referência no atributo de instância, garantindo a persistência.
+            self.tk_image = tk_image 
             
             self.canvas.delete("all")
-            x = (canvas_width - display_img.width) // 2
-            y = (canvas_height - display_img.height) // 2
+            x = (cw - dw) // 2
+            y = (ch - dh) // 2
+            self.canvas.create_image(x, y, anchor=tk.NW, image=self.tk_image)
+            
+            # Não chama refill_preload_buffer aqui se for a primeira imagem, pois _display_initial_pil_image fará isso.
+            # Chama apenas se for uma troca via next_image (buffer).
+            if self.image_index != 0 or self.image_index in self.preloaded_images:
+                 self.refill_preload_buffer() 
+
+        except Exception as e:
+            print(f"Error updating canvas: {e}")
+            
+    def _display_initial_pil_image(self, pil_image, dw, dh, cw, ch):
+        """Exibe a primeira imagem (PIL) na thread principal e inicia o pre-load."""
+        try:
+            # 1. CRÍTICO: Cria o PhotoImage e armazena a referência *imediatamente*.
+            self.tk_image = ImageTk.PhotoImage(pil_image)
+
+            # 2. Desenha no canvas
+            self.canvas.delete("all")
+            x = (cw - dw) // 2
+            y = (ch - dh) // 2
             self.canvas.create_image(x, y, anchor=tk.NW, image=self.tk_image)
             
         except Exception as e:
-            print(f"Tentativa {attempt}: Error: load img - {e}")
-            if self.running:  # Só tenta novamente se o player ainda estiver ativo
-                self.root.after(100, lambda: self.show_image(attempt + 1))
+            print(f"Error displaying initial image: {e}")
+        finally:
+            # 3. Limpa o flag de carregamento e inicia o buffer
+            with self.image_load_lock:
+                if self.image_index in self.loading_indices:
+                    self.loading_indices.remove(self.image_index) 
+            self.refill_preload_buffer() 
 
-    def apply_framing(self, img, canvas_width, canvas_height, frame_type="normal"):
-        """Aplica diferentes tipos de enquadramento na imagem"""
-        self.current_frame_type = frame_type
-        
-        if frame_type == "normal":
-            # Enquadramento normal - redimensiona para caber na tela
-            return self.resize_image(img, canvas_width, canvas_height)
-        else:
-            # Enquadramentos em tamanho 100% - crop de diferentes regiões
-            return self.crop_image_100(img, canvas_width, canvas_height, frame_type)
-
-    def crop_image_100(self, img, canvas_width, canvas_height, crop_type):
-        """Faz crop da imagem mantendo tamanho 100% e retorna região específica"""
-        # Dimensões da área de visualização
-        view_width = canvas_width
-        view_height = canvas_height
-        
-        # Dimensões da imagem original
-        img_width = img.width
-        img_height = img.height
-        
-        # Se a imagem for menor que a área de visualização, centraliza
-        if img_width <= view_width and img_height <= view_height:
-            return img
-        
-        # Define as coordenadas de crop baseado no tipo
-        if crop_type == "center":
-            # Centro da imagem
-            left = max(0, (img_width - view_width) // 2)
-            top = max(0, (img_height - view_height) // 2)
-            
-        elif crop_type == "top_left":
-            # Canto superior esquerdo
-            left = 0
-            top = 0
-            
-        elif crop_type == "top_right":
-            # Canto superior direito
-            left = max(0, img_width - view_width)
-            top = 0
-            
-        elif crop_type == "bottom_left":
-            # Canto inferior esquerdo
-            left = 0
-            top = max(0, img_height - view_height)
-            
-        elif crop_type == "bottom_right":
-            # Canto inferior direito
-            left = max(0, img_width - view_width)
-            top = max(0, img_height - view_height)
-            
-        elif crop_type == "random":
-            # Posição aleatória
-            max_left = max(0, img_width - view_width)
-            max_top = max(0, img_height - view_height)
-            left = random.randint(0, max_left)
-            top = random.randint(0, max_top)
-            
-        else:
-            # Fallback para centro
-            left = max(0, (img_width - view_width) // 2)
-            top = max(0, (img_height - view_height) // 2)
-        
-        # Calcula as coordenadas finais do crop
-        right = min(img_width, left + view_width)
-        bottom = min(img_height, top + view_height)
-        
-        # Faz o crop da imagem
-        cropped_img = img.crop((left, top, right, bottom))
-        
-        return cropped_img
-
-    def resize_image(self, img, canvas_width, canvas_height):
-        """Redimensiona a imagem para caber na tela utilizando as dimensões do canvas"""
-        # If the canvas dimensions are invalid, use fallback values
-        canvas_width = canvas_width if canvas_width > 0 else 800
-        canvas_height = canvas_height if canvas_height > 0 else 600
-
-        img_ratio = img.width / img.height
-        canvas_ratio = canvas_width / canvas_height
-
-        if img_ratio > canvas_ratio:
-            new_width = canvas_width
-            new_height = max(int(canvas_width / img_ratio), 1)
-        else:
-            new_height = canvas_height
-            new_width = max(int(canvas_height * img_ratio), 1)
-
-        return img.resize((new_width, new_height), Image.LANCZOS)
-
-    def apply_frame_to_current_image(self, frame_type):
-        """Aplica um novo enquadramento à imagem atual sem trocar de imagem"""
-        if not self.current_image or not self.running:
+    def initial_load(self, attempt=1): 
+        """Carrega a primeira imagem (índice 0) de forma assíncrona."""
+        if not self.image_paths or attempt > 20:
+            print("Error: Can't load images or canvas dimensions not available.")
             return
+        
+        # 🚨 CORREÇÃO CRÍTICA: Força o Tkinter a calcular a geometria da janela Toplevel
+        self.canvas.update_idletasks() 
+        
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
             
-        try:
-            canvas_width = self.canvas.winfo_width()
-            canvas_height = self.canvas.winfo_height()
-            
-            if canvas_width <= 0 or canvas_height <= 0:
-                return
+        if cw <= 1 or ch <= 1: # Verifica se a dimensão é mínima (1x1)
+            if self.running:
+                # Polling: Tenta novamente em 100ms
+                self.root.after(100, lambda: self.initial_load(attempt + 1))
+            return
+
+        path = self.image_paths[self.image_index]
+        
+        with self.image_load_lock:
+            if self.image_index in self.loading_indices: return
+            self.loading_indices.add(self.image_index) 
+        
+        def initial_load_in_background():
+            try:
+                # HEAVY LIFTING (Background Thread)
+                current_image = Image.open(path)
+                display_img = self.resize_image(current_image, cw, ch)
                 
-            # Aplica o novo enquadramento
-            display_img = self.apply_framing(self.current_image, canvas_width, canvas_height, frame_type)
-            self.tk_image = ImageTk.PhotoImage(display_img)
+                # SCHEDULE UPDATE TO MAIN THREAD, passing the thread-safe PIL Image object
+                self.root.after_idle(lambda: self._display_initial_pil_image(display_img, display_img.width, display_img.height, cw, ch))
+            except Exception as e:
+                print(f"Error loading initial image in thread: {e}")
             
-            self.canvas.delete("all")
-            x = (canvas_width - display_img.width) // 2
-            y = (canvas_height - display_img.height) // 2
-            self.canvas.create_image(x, y, anchor=tk.NW, image=self.tk_image)
+        threading.Thread(target=initial_load_in_background, daemon=True).start()
+
+
+    def refill_preload_buffer(self):
+        """Preenche o buffer de pré-carregamento com as próximas N imagens."""
+        if not self.image_paths: return
+
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1: return
+
+        with self.image_load_lock:
+            current_index = self.image_index
             
-            print(f"🖼️ Enquadramento aplicado: {frame_type}")
-            
-        except Exception as e:
-            print(f"Erro ao aplicar enquadramento: {e}")
+            for i in range(1, PRELOAD_BUFFER_SIZE + 1):
+                target_index = (current_index + i) % len(self.image_paths)
+                
+                if target_index not in self.preloaded_images and target_index not in self.loading_indices:
+                    self.loading_indices.add(target_index)
+                    path = self.image_paths[target_index]
+                    
+                    threading.Thread(
+                        target=self._preload_image_in_background, 
+                        args=(target_index, path, cw, ch), 
+                        daemon=True
+                    ).start()
+
+    def resize_image(self, img, canvas_w, canvas_h):
+        canvas_w = canvas_w if canvas_w > 1 else 800
+        canvas_h = canvas_h if canvas_h > 1 else 600
+        img_ratio = img.width / img.height
+        canvas_ratio = canvas_w / canvas_h
+  
+        if img_ratio > canvas_ratio: 
+            nw = canvas_w
+            nh = max(int(canvas_w / img_ratio), 1)
+        else:
+            nh = canvas_h
+            nw = max(int(canvas_h * img_ratio), 1)
+        return img.resize((nw, nh), Image.LANCZOS)
 
     def next_image(self):
-        """Avança para a próxima imagem"""
-        if not self.image_paths:
+        """Troca a imagem usando a versão pré-carregada, se disponível."""
+        if not self.image_paths: 
             print("Error: No img on folder.")
             return
 
-        # Increment the image index
-        self.image_index = (self.image_index + 1) % len(self.image_paths)
-        self.show_image()
+        with self.image_load_lock:
+            next_index = (self.image_index + 1) % len(self.image_paths)
+            
+            if next_index in self.preloaded_images:
+                # Pega a referência persistente do buffer (já é um ImageTk.PhotoImage)
+                tk_image, dw, dh = self.preloaded_images.pop(next_index)
+                
+                self.image_index = next_index 
+                
+                cw = self.canvas.winfo_width()
+                ch = self.canvas.winfo_height()
+
+                # Usa a função de atualização segura
+                self.root.after_idle(lambda: self._update_canvas_display(tk_image, dw, dh, cw, ch))
+                
+            else:
+                # Fallback
+                print("⚠️ Fallback: Próxima imagem não estava no buffer. Carregamento normal iniciado.")
+                self.image_index = next_index
+                self.initial_load() 
 
     def on_close(self):
-        """Fecha o player e marca como inativo"""
-        self.running = False
-        self.viewer_window.destroy()
+            print("🧹 Limpeza de Player iniciada.")
+            self.running = False
+            
+            # 🟢 ALTERAÇÃO 3A: Limpa o buffer de pré-carregamento
+            with self.image_load_lock:
+                self.preloaded_images.clear() 
+                self.loading_indices.clear()
+                
+            try:
+                self.viewer_window.destroy()
+            except Exception:
+                pass 
+            print("✅ Player encerrado e buffer limpo.")
 
+# -------------------------
+# Main UI class
+# -------------------------
 class ImageViewer:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Control Panel")
-        self.root.geometry("400x650")  # Aumentei um pouco para comportar o novo checkbox
+        self.root.geometry("420x680")
         self.root.protocol("WM_DELETE_WINDOW", self.exit_viewer)
 
-        # Main settings
-        self.players = []  # List of active players
+        # UI / App state
+        self.players = []
         self.include_subfolders = tk.BooleanVar(value=True)
-        self.random_order = tk.BooleanVar(value=True)
-        self.dynamic_framing_enabled = tk.BooleanVar(value=False)  # Nova opção
+        self.random_order = tk.BooleanVar(value=True) 
         self.image_formats = ["jpg", "jpeg", "png", "bmp", "gif"]
+        self.selected_folder = None
 
-        # Audio settings
-        self.samplerate = 44100  # Standard audio sample rate
-        self.blocksize = 1024    # Better block size for processing
-        self.volume_window = []
-        self.window_size = 10
-        self.volume_threshold_factor = 1.10
-        self.valley_threshold_factor = 1.00
-        self.recent_frequencies = []  
-        self.hysteresis = 0
-        self.hysteresis_multiplier = 1
-        self.waiting_for_valley = False
-        self.hysteresis_start_time = 0
+        # audio thread control
+        self.stop_event = threading.Event()
         
-        # Configurações dos níveis de sensibilidade (expandido para 5 níveis)
-        self.sensitivity_level = 1  # Nível atual (1, 2, 3)
-        self.change_request_counter = 0  # Contador para controlar trocas de foto
-        
-        # Bass level tracking for peak validation
-        self.bass_levels = []  # Stores bass levels when valid peaks are detected
-        self.bass_window_size = 10  # Number of bass levels to keep for average
-        
-        # Peak timing tracking - SISTEMA PRINCIPAL (10 valores)
-        self.peak_timestamps = []  # Stores timestamps of valid peaks (window_size=10)
-        self.peak_interval_window_size = 10  # Number of intervals to average
-        self.timing_buffer = 0.130  # x ms buffer before expected peak (configurable)
-        self.default_interval = 0.2  # Intervalo padrão de x segundo para inicialização
-
-        # *** NOVO SISTEMA DE MÚLTIPLAS LISTAS ***
-        self.main_timing_list = []  # Lista principal (até 10 valores)
-        self.secondary_timing_lists = {
-            "sec_1": [],  # Lista secundária 1 (até 5 valores)
-            "sec_2": [],  # Lista secundária 2 (até 5 valores) 
-            "sec_3": [],  # Lista secundária 3 (até 5 valores)
-            "sec_4": [],  # Lista secundária 4 (até 5 valores)
-            "sec_5": [],  # Lista secundária 5 (até 5 valores)
-            "sec_6": [],  # Lista secundária 6 (até 5 valores)
-        }
-        self.current_list_type = "main"  # Tipo de lista atual
-        self.max_secondary_lists = 6 
-        self.list_change_threshold = 0.3  # 30% de diferença para considerar mudança
-        self.list_match_threshold = 0.15  # 15% de similaridade para trocar lista
-        self.secondary_list_min_size = 3  # Mínimo de valores para considerar lista secundária válida
-
-        # Sistema de confirmação rápida
-        self.pattern_confirmation_count = 0
-        self.pending_switch_list = None
-        self.confirmation_threshold = 2  # Troca após 2 confirmações
-
-        # Variáveis para controle de limpeza do histórico
-        self.last_audio_time = time.time()  # Timestamp da última recepção de áudio significativo
-        self.silence_threshold = 0.5  # 0.5 segundos de silêncio
-        self.bass_cleaned = False  # Flag para evitar limpeza repetida
-        self.silence_volume_threshold = 0.01  # Threshold mínimo para considerar como "áudio real"
-        
-        # Controle de visualização do gráfico (decimação)
-        self.visualization_counter = 0  # Contador para controlar atualizações do gráfico
-        self.visualization_decimation = 1  # Atualiza gráfico apenas 1 a cada 10 amostras
-
-        # Audio monitoring control
-        self.audio_running = True
-
-        # Inicializa histórico com timestamps padrão de 1 segundo
-        self.initialize_default_timing()
-
-        # Graphical interface
+        # Build UI FIRST
         self.setup_initial_interface()
-        self.audio_thread = threading.Thread(target=self.listen_to_audio, daemon=True)
-        self.audio_thread.start()
+        
+        sys.stdout = TextRedirector(self.log_text_widget)
+        
+        print(f"=== Song Slide - VU Meter (Buffer de Pré-carregamento: {PRELOAD_BUFFER_SIZE}) ===") 
+        print("Sistema inicializando...")
+
+        # Inicia threads
+        self.capture_thread = ThreadCapture(samplerate=SAMPLERATE, blocksize=BLOCKSIZE, stop_event=self.stop_event)
+        self.processor_thread = ThreadProcessor(samplerate=SAMPLERATE, blocksize=BLOCKSIZE, freq_bands=FREQ_BANDS, stop_event=self.stop_event)
+        
+        self.capture_thread.start()
+        self.processor_thread.start()
+        print("Threads de áudio e processamento iniciadas")
+
+        # schedule visualization updater
+        self.after_id = self.root.after(VIZ_UPDATE_MS, self.update_visualization_from_shared)
+        
+        # schedule beat detection handler
+        self.beat_after_id = self.root.after(50, self.handle_beat_detection)
+
         self.root.mainloop()
 
     def setup_initial_interface(self):
-        """Configura a interface inicial"""
-        self.control_frame = tk.Frame(self.root)
-        self.control_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Button to select folder
-        self.folder_button = tk.Button(self.control_frame, text="Select Folder", command=self.select_folder)
-        self.folder_button.pack(pady=10)
-
-        # Input for image formats
-        self.format_label = tk.Label(self.control_frame, text="Image Formats (separated by commas)")
-        self.format_label.pack(pady=5)
-        self.format_entry = tk.Entry(self.control_frame)
-        self.format_entry.insert(0, ",".join(self.image_formats))
-        self.format_entry.pack(pady=5)
-
-        # Checkbox to include subfolders
-        self.subfolder_check = tk.Checkbutton(self.control_frame, text="Include Subfolders", variable=self.include_subfolders)
-        self.subfolder_check.pack(pady=5)
-
-        # Checkbox for random order
-        self.random_check = tk.Checkbutton(self.control_frame, text="Shuffled Order", variable=self.random_order)
-        self.random_check.pack(pady=5)
-
-        # Control sliders
-        self.setup_interface()
-
-        # Waveform visualization
-        self.setup_waveform_view()
-
-    def on_dynamic_framing_toggle(self):
-        """Callback quando o checkbox de enquadramento dinâmico é alterado"""
-        if self.dynamic_framing_enabled.get():
-            print("🎯 Enquadramento Dinâmico ATIVADO")
-        else:
-            print("🎯 Enquadramento Dinâmico DESATIVADO")
-
-    def setup_interface(self):
-        """Configura os sliders de controle"""
-        config_frame = tk.Frame(self.control_frame)
-        config_frame.pack(pady=10)
-
-        # Slider para níveis de sensibilidade (agora com 5 níveis)
-        self.sensitivity_slider = tk.Scale(
-            config_frame, from_=1, to_=3, orient="horizontal",
-            resolution=1, label="Nível de Sensibilidade", command=lambda v: self.update_sensitivity_level(v)
-        )
-        self.sensitivity_slider.set(self.sensitivity_level)
-        self.sensitivity_slider.pack()
+        frame = tk.Frame(self.root)
+        frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+   
+        # Botão para selecionar pasta
+        btn_frame = tk.Frame(frame)
+        btn_frame.pack(pady=6, fill=tk.X)
         
-        # Label para mostrar descrição do nível atual
-        self.sensitivity_description = tk.Label(config_frame, text="Nível 2: Ignora 1 de cada 2 chamadas")
-        self.sensitivity_description.pack(pady=5)
+        self.select_folder_btn = tk.Button(
+            btn_frame, 
+            text="Selecionar Pasta de Imagens", 
+            command=self.select_folder_and_load,
+            bg="#4CAF50",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            height=2
+        )
+        self.select_folder_btn.pack(fill=tk.X, pady=3)
+        
+        self.folder_label = tk.Label(frame, text="Nenhuma pasta selecionada", fg="gray", wraplength=380)
+        self.folder_label.pack(pady=3)
+        
+        tk.Label(frame, text="Image Formats (comma separated)").pack(pady=3)
+        self.format_entry = tk.Entry(frame)
+        self.format_entry.insert(0, ",".join(self.image_formats))
+        self.format_entry.pack(pady=3, fill=tk.X)
+        tk.Checkbutton(frame, text="Include Subfolders", variable=self.include_subfolders).pack(pady=3)
+        tk.Checkbutton(frame, text="Shuffled Order", variable=self.random_order).pack(pady=3)
+        
+        self.setup_waveform_view(frame)
 
-    def setup_waveform_view(self):
-        """Configura a visualização da forma de onda e a caixa de logs"""
-        frame = tk.Frame(self.control_frame)
-        frame.pack(pady=10, fill=tk.BOTH, expand=True)
+    def select_folder_and_load(self):
+        self.select_folder_btn.config(state=tk.DISABLED, text="Abrindo diálogo...")
+        print("🔍 Abrindo seletor de pasta...")
+        threading.Thread(target=self._open_folder_dialog_thread, daemon=True).start()
+    
+    def _open_folder_dialog_thread(self):
+        try:
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            temp_root.attributes('-topmost', True)
+            
+            folder_path = filedialog.askdirectory(
+                parent=temp_root,
+                title="Selecione a pasta com as imagens"
+            )
+            
+            temp_root.destroy()
+            self.root.after(0, lambda: self._process_selected_folder(folder_path))
+            
+        except Exception as e:
+            print(f"❌ Erro ao abrir diálogo: {e}")
+            self.root.after(0, lambda: self.select_folder_btn.config(
+                state=tk.NORMAL, 
+                text="Selecionar Pasta de Imagens"
+            ))
+    
+    def _process_selected_folder(self, folder_path):
+        self.select_folder_btn.config(state=tk.NORMAL, text="Selecionar Pasta de Imagens")
+        
+        if not folder_path:
+            print("❌ Nenhuma pasta selecionada.")
+            return
+        
+        self.selected_folder = folder_path
+        self.folder_label.config(text=f"Pasta: {folder_path}", fg="black")
+        print(f"📂 Pasta selecionada: {folder_path}")
+        
+        image_formats = [fmt.strip().lower() for fmt in self.format_entry.get().split(",")]
+        include_sub = self.include_subfolders.get()
+        random_ord = self.random_order.get()
+        
+        print(f"⏳ Iniciando carregamento de imagens (Buffer: {PRELOAD_BUFFER_SIZE})...") 
+        
+        threading.Thread(
+            target=self._load_files_in_background, 
+            args=(folder_path, image_formats, include_sub, random_ord), 
+            daemon=True
+        ).start()
 
-        # Waveform visualization
-        self.fig, self.ax = plt.subplots(figsize=(4, 2))
-        self.fig.patch.set_alpha(0)
-        self.ax.set_facecolor('none')
-        self.ax.set_xticks([])
+    def _load_files_in_background(self, folder_path, image_formats, include_subfolders, random_order): 
+        try:
+            image_paths = self.load_images(folder_path, image_formats, include_subfolders, random_order)
+            if image_paths:
+                self.root.after_idle(lambda: self._start_player_in_main_thread(image_paths, random_order))
+        except Exception as e:
+            self.root.after_idle(lambda: messagebox.showerror("Erro de Carregamento", f"Erro ao processar arquivos:\n{e}"))
+            print(f"❌ Erro na thread de carregamento de arquivos: {e}") 
+
+    def _start_player_in_main_thread(self, image_paths, random_order):
+        try:
+            player = Player(self.root, image_paths, random_order)
+            self.players.append(player)
+            print(f"✅ Player criado com {len(image_paths)} imagens")
+        except Exception as e:
+            print(f"❌ Erro ao iniciar Player na thread principal: {e}")
+          
+    def load_images(self, folder_path, image_formats, include_subfolders, random_order):
+        image_paths = []
+        try:
+            if include_subfolders:
+                for root, _, files in os.walk(folder_path):
+                    for file in files:
+                        if any(file.lower().endswith(ext) for ext in image_formats): 
+                            image_paths.append(os.path.join(root, file))
+            else:
+                for file in os.listdir(folder_path):
+                    if any(file.lower().endswith(ext) for ext in image_formats): 
+                        image_paths.append(os.path.join(folder_path, file))
+
+            if not image_paths:
+                self.root.after_idle(lambda: messagebox.showerror("Erro", "Nenhuma imagem válida encontrada!"))
+                return []
+
+            if random_order:
+                random.shuffle(image_paths) 
+
+            print(f"📸 {len(image_paths)} imagens carregadas")
+            return image_paths
+
+        except Exception as e:
+            print(f"❌ Erro ao carregar imagens: {e}")
+            self.root.after_idle(lambda: messagebox.showerror("Erro de Carga", f"Erro ao carregar imagens:\n{e}"))
+            return [] 
+
+    def handle_beat_detection(self):
+        try:
+            while True:
+                command = beat_detection_queue.get_nowait()
+                if command["action"] == "change_image":
+                    for player in self.players:
+                        player.next_image() 
+        except queue.Empty:
+            pass
+        
+        if not self.stop_event.is_set():
+            self.beat_after_id = self.root.after(50, self.handle_beat_detection)
+
+    def setup_waveform_view(self, parent_frame):
+        frame = tk.Frame(parent_frame)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self.fig, self.ax = plt.subplots(figsize=(5, 2.2)) 
+        self.fig.patch.set_facecolor('#1a1a1a')
+        self.ax.set_facecolor('#0a0a0a')
+
+        labels = ['20-100','100-150','150-250','250-500','500-1k','1k-2k','2k-4k','4k-8k','8k-12k','12k-20k']
+        self.ax.set_xticks(np.arange(len(FREQ_BANDS)))
+        self.ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=7, color='#888888')
         self.ax.set_yticks([])
         for spine in self.ax.spines.values():
             spine.set_visible(False)
-        self.ax.set_ylim(-1, 1)
-        self.ax.set_xlim(0, self.blocksize)
-        self.line, = self.ax.plot(np.arange(self.blocksize), np.zeros(self.blocksize), lw=2, color='lime')
-        self.canvas_graph = FigureCanvasTkAgg(self.fig, master=frame)  
-        self.canvas_graph.draw()
-        self.canvas_graph.get_tk_widget().config(bg='black')
-        self.canvas_graph.get_tk_widget().pack(pady=10)
+        self.ax.set_ylim(0, 1.0)
+        self.ax.set_xlim(-0.5, len(FREQ_BANDS)-0.5)
+   
+        self.ax.grid(axis='y', alpha=0.2, linestyle='--', linewidth=0.5) 
 
-        # Log box below the graph
-        self.log_text = tk.Text(frame, height=10, width=40, bg="white", fg="black")
-        self.log_text.pack(pady=5, expand=True, fill=tk.BOTH)
+        init_heights = [0.0] * len(FREQ_BANDS)
+        self.bar_rects = self.ax.bar(np.arange(len(FREQ_BANDS)), init_heights, width=0.7, color='lime', edgecolor='none')
+        self.peak_lines = []
+        for i in range(len(FREQ_BANDS)):
+            line = self.ax.plot([i-0.35, i+0.35], [0, 0], color='red', linewidth=2, alpha=0.8)[0]
+            self.peak_lines.append(line)
 
-        # Redirect prints to the log box
-        sys.stdout = TextRedirector(self.log_text)
+        self.canvas_graph = FigureCanvasTkAgg(self.fig, master=frame)
+        self.canvas_graph.draw() 
+        self.canvas_graph.get_tk_widget().pack(pady=6, fill=tk.BOTH, expand=True)
 
-    # *** NOVAS FUNÇÕES PARA SISTEMA DE MÚLTIPLAS LISTAS ***
+        self.log_text_widget = tk.Text(frame, height=10, width=40, bg="white", fg="black", font=("Comic Sans MS", 11))
+        self.log_text_widget.pack(pady=3, fill=tk.BOTH, expand=True)
 
-    def calculate_list_avg(self, timing_list):
-        """Calcula a média de intervalos de uma lista de timing"""
-        if len(timing_list) < 2:
-            return self.default_interval
-            
-        intervals = []
-        for i in range(1, len(timing_list)):
-            interval = timing_list[i] - timing_list[i-1]
-            intervals.append(interval)
-            
-        return np.mean(intervals) if intervals else self.default_interval
-
-    def should_switch_lists(self, current_interval):
-        """Troca após 2 confirmações do novo padrão"""
-        if self.current_list_type != "main":
-            return False
-            
-        # Verifica se há padrão emergente
-        emerging_list = self.detect_emerging_pattern(current_interval)
-        
-        if emerging_list:
-            # Primeira confirmação ou mesma lista?
-            if self.pending_switch_list == emerging_list:
-                self.pattern_confirmation_count += 1
-                print(f"🔄 {self.pattern_confirmation_count}ª confirmação para {emerging_list.upper()}")
-            else:
-                # Novo padrão detectado - reinicia contador
-                self.pattern_confirmation_count = 1
-                self.pending_switch_list = emerging_list
-                print(f"🔄 1ª confirmação - Padrão {emerging_list.upper()} detectado")
-            
-            # Troca após 2 confirmações
-            if self.pattern_confirmation_count >= self.confirmation_threshold:
-                print(f"✅ {self.confirmation_threshold} confirmações - Trocando para {emerging_list.upper()}!")
-                return True
-        else:
-            # Reset contador se padrão não se confirmou
-            if self.pattern_confirmation_count > 0:
-                print(f"🔄 Reset contador - Padrão não confirmado")
-                self.pattern_confirmation_count = 0
-                self.pending_switch_list = None
-                
-        return False
-
-    def find_best_matching_list(self, current_interval):
-        """Encontra a lista secundária que melhor corresponde ao intervalo atual entre 6 listas"""
-        best_list = None
-        best_diff = float('inf')
-        
-        # Verifica todas as 6 listas secundárias
-        for list_name, timing_list in self.secondary_timing_lists.items():
-            if len(timing_list) >= self.secondary_list_min_size:
-                list_avg = self.calculate_list_avg(timing_list)
-                diff = abs(current_interval - list_avg) / list_avg
-                if diff <= self.list_match_threshold and diff < best_diff:
-                    best_list = list_name
-                    best_diff = diff
-        
-        return best_list
-
-    def switch_to_list(self, list_type):
-        """Troca para uma lista específica com logs detalhados"""
-        if list_type == self.current_list_type:
-            return
-            
-        old_list = self.current_list_type
-        self.current_list_type = list_type
-        
-        emojis = {
-            "main": "🏠", 
-            "sec_1": "📁¹", "sec_2": "📁²", "sec_3": "📁³",
-            "sec_4": "📁⁴", "sec_5": "📁⁵", "sec_6": "📁⁶"
-        }
-        
-        if list_type == "main":
-            print(f"🔄 VOLTANDO para lista PRINCIPAL {emojis['main']}")
-        else:
-            print(f"🔄 TROCA para lista {list_type.upper()} {emojis.get(list_type, '📁')}")
-            
-        # Log de estatísticas
-        current_list = self.get_current_timing_list()
-        if len(current_list) >= 2:
-            current_avg = self.calculate_list_avg(current_list)
-            print(f"   📊 Nova média: {current_avg:.3f}s ({len(current_list)} valores)")
-
-    def update_timing_lists(self, current_time):
-        """Atualiza listas com sistema de confirmação rápida"""
-        if len(self.peak_timestamps) < 2:
-            return
-            
-        current_interval = current_time - self.peak_timestamps[-2]
-        
-        # Atualiza lista principal (mantém últimos 10)
-        self.main_timing_list = self.peak_timestamps[-10:] if len(self.peak_timestamps) >= 10 else self.peak_timestamps.copy()
-        
-        # VERIFICA TROCA ANTES de atualizar secundárias
-        if self.should_switch_lists(current_interval):
-            self.switch_to_list(self.pending_switch_list)
-            # Limpa contador após troca bem-sucedida
-            self.pattern_confirmation_count = 0
-            self.pending_switch_list = None
-        
-        # Atualiza lista secundária (sempre)
-        self.update_secondary_lists(current_time)
-
-
-    def update_secondary_lists(self, current_time):
-        """Atualiza as 6 listas secundárias com o novo timestamp"""
-        if len(self.peak_timestamps) < 2:
-            return
-            
-        current_interval = current_time - self.peak_timestamps[-2]
-        
-        # Encontra lista com menos elementos ou que melhor se encaixa
-        target_list_name = None
-        min_size = float('inf')
-        
-        for list_name, timing_list in self.secondary_timing_lists.items():
-            list_size = len(timing_list)
-            
-            # Prefere listas não cheias
-            if list_size < 5:
-                if list_size < min_size:
-                    min_size = list_size
-                    target_list_name = list_name
-            else:
-                # Se todas estão cheias, encontra a com média mais diferente
-                list_avg = self.calculate_list_avg(timing_list)
-                current_diff = abs(current_interval - list_avg)
-                if target_list_name is None or current_diff > best_diff:
-                    best_diff = current_diff
-                    target_list_name = list_name
-        
-        # Adiciona à lista escolhida
-        if target_list_name:
-            target_list = self.secondary_timing_lists[target_list_name]
-            if len(target_list) >= 5:
-                target_list.pop(0)  # Remove o mais antigo se cheia
-            target_list.append(current_time)
-            
-            print(f"📊 Adicionado à lista {target_list_name.upper()} - Intervalo: {current_interval:.3f}s")
-            self.print_list_status()
-
-    def print_list_status(self):
-        """Mostra status de todas as 7 listas"""
-        status = []
-        main_size = len(self.main_timing_list)
-        main_avg = self.calculate_list_avg(self.main_timing_list) if main_size >= 2 else 0
-        status.append(f"🏠:{main_size}vals({main_avg:.3f}s)")
-        
-        for i in range(1, 7):
-            list_name = f"sec_{i}"
-            timing_list = self.secondary_timing_lists[list_name]
-            list_size = len(timing_list)
-            list_avg = self.calculate_list_avg(timing_list) if list_size >= 2 else 0
-            status.append(f"📁{i}:{list_size}vals({list_avg:.3f}s)")
-        
-        print("   " + " | ".join(status))
-
-    def detect_emerging_pattern(self, current_interval):
-        """Detecta rapidamente quando um novo padrão está surgindo"""
-        if self.current_list_type != "main":
-            return None
-            
-        main_avg = self.calculate_list_avg(self.main_timing_list)
-        
-        # Se não tem dados suficientes, ignora
-        if main_avg <= 0 or len(self.main_timing_list) < 3:
-            return None
-            
-        main_diff = abs(current_interval - main_avg) / main_avg
-        
-        # Se muito diferente da lista atual (>50%)
-        if main_diff > 0.5:
-            # Procura lista secundária compatível
-            best_match = self.find_best_matching_list(current_interval)
-            if best_match:
-                target_list = self.secondary_timing_lists[best_match]
-                if len(target_list) >= 2:  # Pelo menos 2 valores para ter média
-                    list_avg = self.calculate_list_avg(target_list)
-                    list_diff = abs(current_interval - list_avg) / list_avg
-                    
-                    # Se está dentro de 20% da lista secundária
-                    if list_diff <= 0.20:
-                        print(f"🎯 Padrão compatível: {current_interval:.3f}s ~ {list_avg:.3f}s (diff: {list_diff:.2%})")
-                        return best_match
-                        
-        return None
-
-    def get_current_timing_list(self):
-        """Retorna a lista de timing atualmente ativa entre as 7 opções"""
-        if self.current_list_type == "main":
-            return self.main_timing_list
-        else:
-            return self.secondary_timing_lists.get(self.current_list_type, self.main_timing_list)
-        def update_sensitivity_level(self, value):
-            """Atualiza o nível de sensibilidade e reseta o contador"""
-            self.sensitivity_level = int(value)
-            self.change_request_counter = 0  # Reseta contador ao mudar nível
-            
-            # Atualiza descrição do nível (expandido para 5 níveis)
-            descriptions = {
-                1: "Nível 1: Máxima responsividade (todas as chamadas)",
-                2: "Nível 2: Ignora 1 de cada 2 chamadas (50% redução)",
-                3: "Nível 3: Ignora 2 de cada 3 chamadas (66% redução)",
-            }
-            self.sensitivity_description.config(text=descriptions[self.sensitivity_level])
-            print(f"📊 Nível de sensibilidade alterado para: {self.sensitivity_level} - {descriptions[self.sensitivity_level]}")
-
-    def initialize_default_timing(self):
-        """Inicializa o histórico de timing com intervalos padrão de 1 segundo"""
-        current_time = time.time()
-        # Cria 3 timestamps históricos com intervalo de 1 segundo
-        for i in range(3):
-            timestamp = current_time - (3 - i) * self.default_interval
-            self.peak_timestamps.append(timestamp)
-            self.main_timing_list.append(timestamp)
-        
-    def reset_timing_history(self):
-        """Reseta e reinicializa o histórico de timing das 7 listas"""
-        self.bass_levels.clear()
-        self.peak_timestamps.clear()
-        self.main_timing_list.clear()
-        
-        # Limpa todas as 6 listas secundárias
-        for list_name in self.secondary_timing_lists:
-            self.secondary_timing_lists[list_name].clear()
-        
-        self.current_list_type = "main"
-        self.change_request_counter = 0
-        self.initialize_default_timing()
-        print("🔄 Histórico completamente resetado - 7 listas reinicializadas")
-        
-    def select_folder(self):
-        """Seleciona a pasta com as imagens"""
-        folder_path = filedialog.askdirectory(title="Selecione a pasta com as imagens")
-        if not folder_path:
-            return
-
-        # Updates the image formats
-        self.image_formats = [fmt.strip().lower() for fmt in self.format_entry.get().split(",")]
-
-        # Loads the images
-        image_paths = self.load_images(folder_path)
-
-        if image_paths:
-            # Creates a new player with the loaded images
-            player = Player(self.root, image_paths, self.random_order.get())
-            self.players.append(player)
-
-    def load_images(self, folder_path):
-        """Carrega as imagens da pasta selecionada"""
-        image_paths = []
-        if self.include_subfolders.get():
-            for root, _, files in os.walk(folder_path):
-                for file in files:
-                    if any(file.lower().endswith(ext) for ext in self.image_formats):
-                        image_paths.append(os.path.join(root, file))
-        else:
-            for file in os.listdir(folder_path):
-                if any(file.lower().endswith(ext) for ext in self.image_formats):
-                    image_paths.append(os.path.join(folder_path, file))
-
-        if not image_paths:
-            messagebox.showerror("Erro", "Nenhuma imagem válida encontrada!")
-            return []
-
-        if self.random_order.get():
-            random.shuffle(image_paths)
-
-        return image_paths
-
-    def listen_to_audio(self):
-        """Thread principal de captura e análise de áudio"""
-        pythoncom.CoInitialize()
-        
-        # Inicia o monitor de silêncio na thread principal
-        self.root.after(100, self.check_audio_silence)
-        
+    def update_visualization_from_shared(self):
         try:
-            # Usa soundcard para capturar áudio do sistema (loopback)
-            speaker = sc.default_speaker()
-            
-            # Usa uma versão mais robusta do sounddevice para loopback
-            # Lista dispositivos disponíveis para encontrar o loopback
-            devices = sd.query_devices()
-            loopback_device = None
-            
-            for i, device in enumerate(devices):
-                if 'loopback' in device['name'].lower() or 'stereo mix' in device['name'].lower():
-                    loopback_device = i
-                    break
-            
-            if loopback_device is not None:
-                print(f"Usando dispositivo loopback: {devices[loopback_device]['name']}")
-                
-                def audio_callback(indata, frames, time, status):
-                    if status:
-                        print(f"Audio status: {status}")
-                    self.process_audio_data(indata)
-                
-                with sd.InputStream(callback=audio_callback, 
-                                  device=loopback_device,
-                                  channels=1, 
-                                  samplerate=self.samplerate, 
-                                  blocksize=self.blocksize):
-                    print("Audio monitoring started...")
-                    while self.audio_running:
-                        time.sleep(0.1)
-            else:
-                # Fallback para soundcard se não encontrar dispositivo loopback
-                print("Dispositivo loopback não encontrado, usando soundcard...")
-                self.fallback_soundcard_audio()
-                    
-        except Exception as e:
-            print(f"Error: on audio {e}")
-            # Tenta fallback para soundcard
-            self.fallback_soundcard_audio()
-        finally:
-            pythoncom.CoUninitialize()
+            updated = False
+            with shared_lock:
+                if shared_state.get("vu_updated"):
+                    bh = shared_state.get("bar_heights", []) 
+                    ph = shared_state.get("peak_heights", []) 
+                    shared_state["vu_updated"] = False
+                    updated = True
+                else: 
+                    bh = None
+                    ph = None
 
-    def fallback_soundcard_audio(self):
-        """Fallback usando soundcard para capturar áudio do sistema"""
-        try:
-            # Patch temporário para numpy compatibility
-            import soundcard.mediafoundation
-            original_fromstring = np.fromstring
-            
-            def patched_fromstring(string, dtype, **kwargs):
-                if hasattr(string, 'raw'):
-                    return np.frombuffer(string.raw, dtype=dtype, **kwargs)
-                else:
-                    return np.frombuffer(string, dtype=dtype, **kwargs)
-            
-            np.fromstring = patched_fromstring
-            
-            speaker = sc.default_speaker()
-            mic = sc.get_microphone(speaker.name, include_loopback=True)
-            
-            with mic.recorder(samplerate=self.samplerate) as mic_stream:
-                print("Audio monitoring started with soundcard...")
-                
-                while self.audio_running:
-                    try:
-                        data = mic_stream.record(numframes=self.blocksize)
-                        self.process_audio_data(data)
-                    except Exception as e:
-                        print(f"Erro na captura: {e}")
-                        time.sleep(0.1)
-                        
-        except Exception as e:
-            print(f"Erro no soundcard fallback: {e}")
-        finally:
-            # Restaura o método original
-            np.fromstring = original_fromstring
-
-    def process_audio_data(self, data):
-        """Processa os dados de áudio capturados"""
-        try:
-            # Fix for numpy compatibility
-            data = np.asarray(data, dtype=np.float32)
-            if data.ndim > 1:
-                data = data.flatten()
-            
-            raw_volume = np.sqrt(np.mean(data**2))
-            
-            # Só atualiza last_audio_time se o volume for significativo (não é silêncio)
-            current_time = time.time()
-            if raw_volume > self.silence_volume_threshold:
-                self.last_audio_time = current_time
-                
-                # Se estava em silêncio e agora recebeu áudio significativo, resetar flag de limpeza
-                if self.bass_cleaned:
-                    self.bass_cleaned = False
-                    print("📊 Áudio significativo detectado novamente - Flag de limpeza resetada")
-            
-            self.volume_window.append(raw_volume)
-
-            if len(self.volume_window) > self.window_size:
-                self.volume_window.pop(0)
-
-            dominant_freq = self.analyze_frequencies(data)
-            self.recent_frequencies.append(dominant_freq)
-            if len(self.recent_frequencies) > self.window_size:
-                self.recent_frequencies.pop(0)
-
-            # Analyze bass level for this audio chunk
-            bass_level = self.analyze_bass_level(data)
-
-            # Atualiza visualização apenas a cada X amostras (decimação)
-            self.visualization_counter += 1
-            if self.visualization_counter >= self.visualization_decimation:
-                self.visualization_counter = 0  # Reset counter
-                # Schedule visualization update on main thread
-                self.root.after_idle(lambda: self.update_visualization(data))
-
-            if len(self.volume_window) == self.window_size:
-                self.dynamic_detection(bass_level)
-                
-        except Exception as e:
-            print(f"Erro no processamento de áudio: {e}")
-
-    def check_audio_silence(self):
-        """Verifica se houve silêncio por mais de 0.5s e limpa histórico se necessário"""
-        try:
-            current_time = time.time()
-            time_since_last_audio = current_time - self.last_audio_time
-            
-            # Se passou do threshold de silêncio E ainda não limpou
-            if time_since_last_audio > self.silence_threshold and not self.bass_cleaned:
-                if len(self.bass_levels) > 0:
-                    print(f"🧹 Silêncio detectado por {time_since_last_audio:.2f}s - Limpando histórico de {len(self.bass_levels)} níveis de grave")
-                    # Reset completo e reinicialização
-                    self.reset_timing_history()
-                    self.bass_cleaned = True
-                else:
-                    # Marca como limpo mesmo se não havia dados
-                    self.bass_cleaned = True
-                    
-        except Exception as e:
-            print(f"Erro na verificação de silêncio: {e}")
-        
-        # Agenda próxima verificação em 100ms
-        if self.audio_running:
-            self.root.after(100, self.check_audio_silence)
-
-    def analyze_frequencies(self, audio_data):
-        """Aplica FFT no áudio e retorna a frequência dominante"""
-        try:
-            if len(audio_data) < 2:
-                return 0.0
-                
-            fft_result = np.fft.fft(audio_data)
-            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
-            magnitude = np.abs(fft_result)
-            
-            # Ignora frequência DC (0 Hz)
-            magnitude[0] = 0
-            
-            if len(magnitude) == 0:
-                return 0.0
-                
-            dominant_freq = freqs[np.argmax(magnitude)]
-            return abs(dominant_freq)
-        except Exception as e:
-            print(f"Erro na análise de frequência: {e}")
-            return 0.0
-
-    def analyze_bass_level(self, audio_data):
-        """Analisa o nível de graves no áudio (frequências baixas 20-250 Hz)"""
-        try:
-            if len(audio_data) < 2:
-                return 0.0
-                
-            fft_result = np.fft.fft(audio_data)
-            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
-            magnitude = np.abs(fft_result)
-            
-            # Define range de frequências graves (20-110 Hz)
-            bass_mask = (np.abs(freqs) >= 10) & (np.abs(freqs) <= 110)
-            
-            if np.any(bass_mask):
-                bass_magnitude = magnitude[bass_mask]
-                bass_level = np.mean(bass_magnitude)
-                return bass_level
-            else:
-                return 0.0
-                
-        except Exception as e:
-            print(f"Erro na análise de graves: {e}")
-            return 0.0
-        
-    def dynamic_detection(self, current_bass_level):
-        """Modifica a lógica de detecção de som com validação de graves e timing"""
-        if len(self.recent_frequencies) == 0:
-            return
-
-        try:
-            baseline = np.percentile(self.volume_window, 70)
-            valley_base = np.percentile(self.volume_window, 30)
-            peak_threshold = baseline * self.volume_threshold_factor
-            valley_threshold = valley_base * self.valley_threshold_factor
-            current_volume = self.volume_window[-1]
-            current_time = time.time()
-
-            avg_frequency = np.mean(self.recent_frequencies)
-
-            if hasattr(self, 'waiting_for_valley') and self.waiting_for_valley and hasattr(self, 'hysteresis_start_time') and (current_time - self.hysteresis_start_time) < self.hysteresis:
-                peak_threshold *= self.hysteresis_multiplier
-
-            # Check if current volume exceeds threshold
-            if current_volume > peak_threshold:
-                if not hasattr(self, 'waiting_for_valley') or not self.waiting_for_valley:
-                    
-                    # Validate peak using bass level average
-                    is_valid_peak = True
-                    
-                    # Se já temos algum nível de grave registrado, valida contra a média
-                    if len(self.bass_levels) > 0:
-                        # Calculate average bass level from previous valid peaks
-                        avg_bass_level = np.mean(self.bass_levels)
-                        
-                        # Peak is valid if bass level is sufficient
-                        if current_bass_level < (avg_bass_level * 0.5):  # Bass too low
-                            is_valid_peak = False
-                            print(f"❌ Falso pico detectado - Grave muito baixo: {current_bass_level:.4f} (média: {avg_bass_level:.4f})")
-                    else:
-                        # Se não temos histórico de graves, aceita qualquer grave > threshold mínimo
-                        min_bass_threshold = 0.001  # Threshold mínimo para considerar grave válido
-                        if current_bass_level < min_bass_threshold:
-                            is_valid_peak = False
-                            print(f"❌ Primeiro pico rejeitado - Grave insuficiente: {current_bass_level:.4f} < {min_bass_threshold:.4f}")
+            if updated and bh is not None:
+                for i, rect in enumerate(self.bar_rects):
+                    if i < len(bh): 
+                        h = bh[i]
+                        rect.set_height(h)
+                        if h < 0.3: 
+                            # Nível 1: Azul Gelo (muito baixo)
+                            rect.set_color('#33B8A5') 
+                        elif h < 0.5:
+                            # Nível 2: Ciano Elétrico (baixo)
+                            rect.set_color('#33A7D8') 
+                        elif h < 0.7:
+                            # Nível 3: Verde Ácido (médio)
+                            rect.set_color('#3276B5') 
+                        elif h < 0.9:
+                            # Nível 4: Magenta (alto)
+                            rect.set_color('#8869AD')
                         else:
-                            print(f"✅ Primeiro pico aceito - Estabelecendo baseline de grave: {current_bass_level:.4f}")
-                    
-                    # *** MODIFICAÇÃO: Usa lista atual para cálculos de timing ***
-                    current_timing_list = self.get_current_timing_list()
-                    
-                    # Check peak timing if we have previous peaks
-                    if is_valid_peak and len(current_timing_list) > 0:
-                        time_since_last_peak = current_time - current_timing_list[-1]
-                        
-                        # Calculate average interval between peaks da lista atual
-                        if len(current_timing_list) >= 2:
-                            intervals = []
-                            for i in range(1, min(len(current_timing_list), self.peak_interval_window_size + 1)):
-                                interval = current_timing_list[-i] - current_timing_list[-i-1]
-                                intervals.append(interval)
-                            
-                            avg_interval = np.mean(intervals)
-                            
-                            # Ignora médias acima de 1 segundo
-                            if avg_interval > 1.0:
-                                print(f"⚠️ Média de ({avg_interval:.3f}s),")
-                            else:
-                                # Apply timing buffer - expect peak 100ms earlier than average
-                                expected_time = avg_interval - self.timing_buffer
-                                
-                                # If peak is coming too early (before expected time), require higher threshold
-                                if time_since_last_peak < expected_time:
-                                    # Calcula threshold dinâmico que diminui conforme se aproxima do tempo esperado
-                                    # Começa em 1.50 no tempo 0 e vai diminuindo até 1.00 no tempo esperado
-                                    
-                                    # Proporção de quanto já passou do tempo esperado (0.0 = início, 1.0 = tempo esperado)
-                                    time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0
-                                    
-                                    # Interpola entre 1.50 (início) e 1.00 (fim)
-                                    dynamic_threshold = 1.50 - (0.50 * time_ratio)
-                                    
-                                    required_threshold = peak_threshold * dynamic_threshold
-                                    
-                                    if current_volume < required_threshold:
-                                        is_valid_peak = False
-                                        print(f"❌ Pico muito cedo - Requer {dynamic_threshold:.2f}x ({dynamic_threshold:.0%}) acima do normal.")
-                                        print(f"   Intervalo atual: {time_since_last_peak:.3f}s ({time_ratio:.1%} do esperado)")
-                                        print(f"   Tempo esperado: {expected_time:.3f}s (média: {avg_interval:.3f}s - buffer: {self.timing_buffer:.3f}s)")
-                                        print(f"   Volume atual: {current_volume:.4f}, Necessário: {required_threshold:.4f}")
-                                    else:
-                                        print(f"✅ Pico cedo mas forte o suficiente: {current_volume:.4f} ≥ {required_threshold:.4f} (threshold: {dynamic_threshold:.2f}x)")
-                                else:
-                                    print(f"⏰ Pico no timing esperado: {time_since_last_peak:.3f}s ≥ {expected_time:.3f}s")
-                    
-                    if is_valid_peak:
-                        # Record bass level and timestamp for this valid peak
-                        self.bass_levels.append(current_bass_level)
-                        if len(self.bass_levels) > self.bass_window_size:
-                            self.bass_levels.pop(0)
-                        
-                        # *** MODIFICAÇÃO: Atualiza sistema principal E gerencia listas ***
-                        self.peak_timestamps.append(current_time)
-                        if len(self.peak_timestamps) > self.peak_interval_window_size:
-                            self.peak_timestamps.pop(0)
-                        
-                        # *** NOVO: Atualiza sistema de múltiplas listas ***
-                        self.update_timing_lists(current_time)
-                        
-                        # Calcula média atual de graves (sempre disponível após o primeiro pico)
-                        avg_bass = np.mean(self.bass_levels)
-                        
-                        # Verifica se deve trocar imagem ou aplicar enquadramento baseado no nível de sensibilidade
-                        action_result = self.should_change_image()
-                        
-                        # *** MODIFICAÇÃO: Usa lista atual para display ***
-                        current_list = self.get_current_timing_list()
-                        if len(current_list) >= 2:
-                            last_interval = current_list[-1] - current_list[-2]
-                            # Calculate current average for display
-                            intervals = []
-                            for i in range(1, min(len(current_list), self.peak_interval_window_size + 1)):
-                                interval = current_list[-i] - current_list[-i-1]
-                                intervals.append(interval)
-                            current_avg_interval = np.mean(intervals)
-                            
-                            # Define emoji baseado na ação
-                            if action_result["action"] == "change_image":
-                                status_emoji = "🔄"
-                            elif action_result["action"] == "apply_frame":
-                                status_emoji = "🖼️"
-                            else:  # ignore
-                                status_emoji = "🔇"
-                            
-                            list_emoji = "🏠" if self.current_list_type == "main" else "📁"
-                            print(f"{status_emoji} {list_emoji} Pico válido - Freq: {avg_frequency:.2f} Hz | Volume: {current_volume:.4f} | Grave: {current_bass_level:.4f} (média: {avg_bass:.4f})")
-                            print(f"   Intervalo: {last_interval:.3f}s | Média: {current_avg_interval:.3f}s | Lista: {self.current_list_type} | Nível: {self.sensitivity_level}")
-                        else:
-                            # Define emoji baseado na ação
-                            if action_result["action"] == "change_image":
-                                status_emoji = "🔄"
-                            elif action_result["action"] == "apply_frame":
-                                status_emoji = "🖼️"
-                            else:  # ignore
-                                status_emoji = "🔇"
-                            
-                            list_emoji = "🏠" if self.current_list_type == "main" else "📁"
-                            print(f"{status_emoji} {list_emoji} Pico válido - Freq: {avg_frequency:.2f} Hz | Volume: {current_volume:.4f} | Grave: {current_bass_level:.4f} (média: {avg_bass:.4f}) | Lista: {self.current_list_type} | Nível: {self.sensitivity_level}")
-                        
-                        # Executa a ação determinada
-                        if action_result["action"] == "change_image":
-                            for player in self.players:
-                                if player.running:  
-                                    player.next_image()
-                        elif action_result["action"] == "apply_frame":
-                            for player in self.players:
-                                if player.running:
-                                    player.apply_frame_to_current_image(action_result["frame_type"])
-                        # Se action for "ignore", não faz nada
-                                
-                        self.waiting_for_valley = True
-                        self.hysteresis_start_time = current_time
-
-            elif current_volume < valley_threshold:
-                self.waiting_for_valley = False
-        except Exception as e:
-            print(f"Erro na detecção: {e}")
-
-    def should_change_image(self):
-        """Determina se deve trocar a imagem ou aplicar enquadramento baseado no nível de sensibilidade"""
-        self.change_request_counter += 1
-        
-        # Se enquadramento dinâmico não estiver ativado, usa lógica original
-        if not self.dynamic_framing_enabled.get():
-            return self._original_should_change_logic()
-        
-        # Nova lógica com enquadramento dinâmico
-        if self.sensitivity_level == 1:
-            # Nível 1: Sempre troca (sem enquadramentos)
-            return {"action": "change_image", "frame_type": None}
-        
-        elif self.sensitivity_level == 2:
-            # Nível 2: 1º normal, 2º enquadramento, 3º troca
-            position_in_cycle = (self.change_request_counter - 1) % 2 + 1
-            
-            if position_in_cycle == 1:
-                # Primeira chamada do ciclo - mostra normal (mas só troca se for realmente a primeira imagem)
-                if self.change_request_counter == 1:
-                    return {"action": "change_image", "frame_type": None}
-                else:
-                    return {"action": "change_image", "frame_type": None}
-            else:
-                # Segunda chamada - aplica enquadramento
-                return {"action": "apply_frame", "frame_type": "center"}
-                
-        elif self.sensitivity_level == 3:
-            # Nível 3: 1º normal, 2º enquadramento, 3º enquadramento, 4º troca
-            position_in_cycle = (self.change_request_counter - 1) % 3 + 1
-            
-            if position_in_cycle == 1:
-                return {"action": "change_image", "frame_type": None}
-            elif position_in_cycle == 2:
-                return {"action": "apply_frame", "frame_type": "center"}
-            else:  # position_in_cycle == 3
-                return {"action": "apply_frame", "frame_type": "random"}
-                
-        elif self.sensitivity_level == 4:
-            # Nível 4: 1º normal, 2º-4º enquadramentos, 5º troca
-            position_in_cycle = (self.change_request_counter - 1) % 4 + 1
-            
-            if position_in_cycle == 1:
-                return {"action": "change_image", "frame_type": None}
-            elif position_in_cycle == 2:
-                return {"action": "apply_frame", "frame_type": "top_left"}
-            elif position_in_cycle == 3:
-                return {"action": "apply_frame", "frame_type": "center"}
-            else:  # position_in_cycle == 4
-                return {"action": "apply_frame", "frame_type": "bottom_right"}
-                
-        elif self.sensitivity_level == 5:
-            # Nível 5: 1º normal, 2º-5º enquadramentos diferentes, 6º troca
-            position_in_cycle = (self.change_request_counter - 1) % 5 + 1
-            
-            if position_in_cycle == 1:
-                return {"action": "change_image", "frame_type": None}
-            elif position_in_cycle == 2:
-                return {"action": "apply_frame", "frame_type": "top_left"}
-            elif position_in_cycle == 3:
-                return {"action": "apply_frame", "frame_type": "center"}
-            elif position_in_cycle == 4:
-                return {"action": "apply_frame", "frame_type": "bottom_right"}
-            else:  # position_in_cycle == 5
-                return {"action": "apply_frame", "frame_type": "random"}
-        
-        return {"action": "change_image", "frame_type": None}  # Fallback
-
-    def _original_should_change_logic(self):
-        """Lógica original de troca de imagem (para quando enquadramento dinâmico está desabilitado)"""
-        if self.sensitivity_level == 1:
-            return {"action": "change_image", "frame_type": None}
-        elif self.sensitivity_level == 2:
-            if self.change_request_counter % 2 == 1:
-                return {"action": "change_image", "frame_type": None}
-            else:
-                print("🔇 Troca ignorada (Nível 2)")
-                return {"action": "ignore", "frame_type": None}
-        elif self.sensitivity_level == 3:
-            if self.change_request_counter % 3 == 1:
-                return {"action": "change_image", "frame_type": None}
-            else:
-                print("🔇 Troca ignorada (Nível 3)")
-                return {"action": "ignore", "frame_type": None}
-        elif self.sensitivity_level == 4:
-            if self.change_request_counter % 4 == 1:
-                return {"action": "change_image", "frame_type": None}
-            else:
-                print("🔇 Troca ignorada (Nível 4)")
-                return {"action": "ignore", "frame_type": None}
-        elif self.sensitivity_level == 5:
-            if self.change_request_counter % 5 == 1:
-                return {"action": "change_image", "frame_type": None}
-            else:
-                print("🔇 Troca ignorada (Nível 5)")
-                return {"action": "ignore", "frame_type": None}
-        
-        return {"action": "change_image", "frame_type": None}  # Fallback
-                
-    def update_visualization(self, data):
-        """Atualiza a visualização da forma de onda"""
-        try:
-            if hasattr(self, 'line') and len(data) > 0:
-                # Calcula fator de decimação baseado na diferença de samplerate
-                # Original: 44100, Desejado para gráfico: 10040
-                decimation_factor = int(44100 / 30000)  # ≈ 4.4, arredonda para 4
-                
-                # Aplica decimação nos dados (pega 1 a cada 4 amostras)
-                decimated_data = data[::decimation_factor]
-                
-                # Normaliza os dados decimados para melhor visualização
-                normalized_data = decimated_data / (np.max(np.abs(decimated_data)) + 1e-10)
-                
-                # Ajusta o tamanho para caber no gráfico
-                target_size = self.blocksize // decimation_factor  # ≈ 256 pontos
-                
-                if len(normalized_data) > target_size:
-                    normalized_data = normalized_data[:target_size]
-                elif len(normalized_data) < target_size:
-                    # Pad with zeros if needed
-                    padded_data = np.zeros(target_size)
-                    padded_data[:len(normalized_data)] = normalized_data
-                    normalized_data = padded_data
-                
-                # Atualiza o gráfico com dados decimados
-                self.line.set_ydata(normalized_data)
-                self.line.set_xdata(np.arange(len(normalized_data)))
-                
-                # Ajusta escala X do gráfico para os novos dados
-                self.ax.set_xlim(0, len(normalized_data))
-                
-                # Force canvas update
+                            # Nível 5: Vermelho Brilhante (pico)
+                            rect.set_color('#B868AD')
+                for i, pline in enumerate(self.peak_lines):
+                    if i < len(ph):
+                        phv = ph[i]
+                        pline.set_ydata([phv, phv]) 
                 self.canvas_graph.draw_idle()
-                
         except Exception as e:
-            print(f"Erro na visualização: {e}")
+            print("update_visualization error:", e)
+        if not self.stop_event.is_set():
+            self.after_id = self.root.after(VIZ_UPDATE_MS, self.update_visualization_from_shared)
 
-    def exit_viewer(self, event=None):
-        """Fecha todos os players, encerra as threads e finaliza o programa de forma segura."""
-        print("Exiting...")
+    def exit_viewer(self):
+        print("🛑 Encerrando aplicação...")
+        self.stop_event.set() 
+        try:
+            if hasattr(self, 'capture_thread') and self.capture_thread.is_alive():
+                self.capture_thread.join(timeout=0.5)
+            if hasattr(self, 'processor_thread') and self.processor_thread.is_alive():
+                self.processor_thread.join(timeout=0.5)
+        except Exception as e:
+            print(f"Erro ao parar threads: {e}") 
+        
+        try:
+            if hasattr(self, "after_id") and self.after_id is not None:
+                self.root.after_cancel(self.after_id)
+            if hasattr(self, "beat_after_id") and self.beat_after_id is not None:
+                self.root.after_cancel(self.beat_after_id)
+        except Exception:
+            pass 
+        
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
 
-        # Para o monitoramento de áudio
-        self.audio_running = False
-
-        # Closes all players
-        for player in self.players:
-            player.on_close()
-
-        # Closes the graphical interface
-        self.root.quit()  
-        self.root.destroy()  
-
+# -------------------------
+# Entrypoint
+# -------------------------
 if __name__ == "__main__":
-    ImageViewer()
+    try:
+        ImageViewer()
+    except Exception as e:
+        print("Fatal error:", e)
