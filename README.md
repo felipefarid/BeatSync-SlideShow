@@ -1,6 +1,6 @@
 # Song_Slide
 Slideshow player that synchronizes image transitions with real-time audio
-* Only tested on Windows devices
+* Tested on Windows 11 and Debian Linux
 
 # Audio-Synced Slideshow Player
 
