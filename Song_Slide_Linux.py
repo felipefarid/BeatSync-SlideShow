@@ -239,7 +239,7 @@ class ThreadProcessor(threading.Thread):
         self.peak_interval_window_size = 5
         self.timing_buffer = 0.130
         
-        self.default_interval = 0.5 
+        self.default_interval = 0.6 
         self.dynamic_threshold_max = 1.90 
         self.non_bass_override_factor = 1.60 
 
