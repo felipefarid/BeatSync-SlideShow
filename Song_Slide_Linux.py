@@ -221,15 +221,15 @@ class ThreadProcessor(threading.Thread):
         
         # --- LÓGICA AVANÇADA DE DETECÇÃO ---
         self.volume_window = [] 
-        self.window_size = 10 
-        self.volume_threshold_factor = 1.00 
-        self.valley_threshold_factor = 0.95 
+        self.window_size = 5 
+        self.volume_threshold_factor = 1.10 
+        self.valley_threshold_factor = 1.00 
         self.recent_frequencies = []  
         
         # Histerese
         self.hysteresis = 0.2        
         self.hysteresis_multiplier = 1.5 
-        self.waiting_for_valley = True
+        self.waiting_for_valley = False
         self.hysteresis_start_time = 0
         
         self.bass_levels = []
