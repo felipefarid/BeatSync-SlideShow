@@ -221,9 +221,9 @@ class ThreadProcessor(threading.Thread):
         
         # --- LÓGICA AVANÇADA DE DETECÇÃO ---
         self.volume_window = [] 
-        self.window_size = 5 
-        self.volume_threshold_factor = 1.10 
-        self.valley_threshold_factor = 1.00 
+        self.window_size = 10 
+        self.volume_threshold_factor = 1.025 
+        self.valley_threshold_factor = 0.95 
         self.recent_frequencies = []  
         
         # Histerese
@@ -237,11 +237,11 @@ class ThreadProcessor(threading.Thread):
         
         self.peak_timestamps = [] 
         self.peak_interval_window_size = 5
-        self.timing_buffer = 0.130
+        self.timing_buffer = 0.05
         
-        self.default_interval = 0.6 
-        self.dynamic_threshold_max = 1.90 
-        self.non_bass_override_factor = 1.60 
+        self.default_interval = 0.2 
+        self.dynamic_threshold_max = 1.40 
+        self.non_bass_override_factor = 1.80 
 
         self.main_timing_list = [] 
 
