@@ -363,13 +363,13 @@ class ThreadProcessor(threading.Thread):
     def dynamic_detection(self, current_bass_level, current_volume, current_time):
         try:
             baseline = np.percentile(self.volume_window, 70)
-            valley_base = np.percentile(self.volume_window, 30)
+            valley_base = np.percentile(self.volume_window, 50)
   
             peak_threshold = baseline * self.volume_threshold_factor 
             valley_threshold = valley_base * self.valley_threshold_factor 
             
             if self.waiting_for_valley and (current_time - self.hysteresis_start_time) < self.hysteresis:
-                peak_threshold *= self.hysteresis_multiplier 
+                peak_threshold *= 1.0 
 
             if current_volume > peak_threshold:
                 if not self.waiting_for_valley:
@@ -973,5 +973,3 @@ if __name__ == "__main__":
         ImageViewer()
     except Exception as e:
         print("Fatal error:", e)
-
-
