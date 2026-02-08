@@ -187,13 +187,13 @@ class ThreadProcessor(threading.Thread):
         # --- LÓGICA AVANÇADA DE DETECÇÃO ---
         self.volume_window = [] 
         self.window_size = 10 
-        self.volume_threshold_factor = 1.15 
-        self.valley_threshold_factor = 0.90
+        self.volume_threshold_factor = 1.0 
+        self.valley_threshold_factor = 0.95
         self.recent_frequencies = []  
         
         # Histerese
         self.hysteresis = 0.2        
-        self.waiting_for_valley = True
+        self.waiting_for_valley = False
         self.hysteresis_start_time = 0
         
         self.bass_levels = []
@@ -201,10 +201,10 @@ class ThreadProcessor(threading.Thread):
         
         self.peak_timestamps = [] 
         self.peak_interval_window_size = 5
-        self.timing_buffer = 0.05
+        self.timing_buffer = 0.02
         
         self.default_interval = 0.2  
-        self.non_bass_override_factor = 1.50 
+        self.non_bass_override_factor = 3.0
 
         self.main_timing_list = [] 
 
@@ -378,7 +378,7 @@ class ThreadProcessor(threading.Thread):
                     if len(self.bass_levels) > 0: 
                         avg_bass_level = np.mean(self.bass_levels) 
                   
-                        if current_bass_level < (avg_bass_level * 0.5): 
+                        if current_bass_level < (avg_bass_level * 0.6): 
                             override_threshold = baseline * self.non_bass_override_factor 
 
                             if current_volume < override_threshold:
@@ -404,7 +404,7 @@ class ThreadProcessor(threading.Thread):
                                     time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0 
                                     time_ratio = np.clip(time_ratio, 0.0, 1.0) 
                                     
-                                    dynamic_threshold = 1.0 + 0.40 * (0.5 + 0.5 * np.cos(np.pi * time_ratio))**2 - 0.50 * time_ratio
+                                    dynamic_threshold = 1.00 + 0.70 * (0.5 + 0.5 * np.cos(np.pi * time_ratio))**2 - 0.10 * time_ratio
                                     required_threshold = peak_threshold * dynamic_threshold
 
                                     if current_volume < required_threshold:
@@ -696,7 +696,7 @@ class ImageViewer:
         self.players = []
         self.include_subfolders = tk.BooleanVar(value=True)
         self.random_order = tk.BooleanVar(value=True) 
-        self.image_formats = ["jpg", "jpeg", "png", "bmp", "gif"]
+        self.image_formats = ["jpg", "jpeg", "png", "bmp", "gif", "webp"]
         self.selected_folder = None
 
         # audio thread control
