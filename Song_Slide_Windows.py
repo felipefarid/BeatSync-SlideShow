@@ -187,14 +187,13 @@ class ThreadProcessor(threading.Thread):
         # --- LÓGICA AVANÇADA DE DETECÇÃO ---
         self.volume_window = [] 
         self.window_size = 10 
-        self.volume_threshold_factor = 1.025 
-        self.valley_threshold_factor = 0.95 
+        self.volume_threshold_factor = 1.15 
+        self.valley_threshold_factor = 0.90
         self.recent_frequencies = []  
         
         # Histerese
         self.hysteresis = 0.2        
-        self.hysteresis_multiplier = 1.5 
-        self.waiting_for_valley = False
+        self.waiting_for_valley = True
         self.hysteresis_start_time = 0
         
         self.bass_levels = []
@@ -204,9 +203,8 @@ class ThreadProcessor(threading.Thread):
         self.peak_interval_window_size = 5
         self.timing_buffer = 0.05
         
-        self.default_interval = 0.2 
-        self.dynamic_threshold_max = 1.40 
-        self.non_bass_override_factor = 1.80 
+        self.default_interval = 0.2  
+        self.non_bass_override_factor = 1.50 
 
         self.main_timing_list = [] 
 
@@ -406,7 +404,7 @@ class ThreadProcessor(threading.Thread):
                                     time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0 
                                     time_ratio = np.clip(time_ratio, 0.0, 1.0) 
                                     
-                                    dynamic_threshold = self.dynamic_threshold_max - (0.50 * time_ratio) 
+                                    dynamic_threshold = 1.0 + 0.40 * (0.5 + 0.5 * np.cos(np.pi * time_ratio))**2 - 0.50 * time_ratio
                                     required_threshold = peak_threshold * dynamic_threshold
 
                                     if current_volume < required_threshold:
@@ -975,4 +973,5 @@ if __name__ == "__main__":
         ImageViewer()
     except Exception as e:
         print("Fatal error:", e)
+
 
