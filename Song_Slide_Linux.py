@@ -222,13 +222,13 @@ class ThreadProcessor(threading.Thread):
         # --- LÓGICA AVANÇADA DE DETECÇÃO ---
         self.volume_window = [] 
         self.window_size = 10 
-        self.volume_threshold_factor = 1.15 
-        self.valley_threshold_factor = 0.90
+        self.volume_threshold_factor = 1.0 
+        self.valley_threshold_factor = 0.95
         self.recent_frequencies = []  
         
         # Histerese
         self.hysteresis = 0.2        
-        self.waiting_for_valley = True
+        self.waiting_for_valley = False
         self.hysteresis_start_time = 0
         
         self.bass_levels = []
@@ -236,17 +236,16 @@ class ThreadProcessor(threading.Thread):
         
         self.peak_timestamps = [] 
         self.peak_interval_window_size = 5
-        self.timing_buffer = 0.05
+        self.timing_buffer = 0.02
         
         self.default_interval = 0.2  
-        self.non_bass_override_factor = 1.50 
+        self.non_bass_override_factor = 3.0
 
         self.main_timing_list = [] 
 
         self.last_audio_time = time.time()
         self.silence_threshold = 0.5
         self.bass_cleaned = False
-        self.silence_volume_threshold = 0.01
         self.silence_volume_threshold = 0.01
 
     def run(self):
@@ -406,7 +405,7 @@ class ThreadProcessor(threading.Thread):
             valley_threshold = valley_base * self.valley_threshold_factor 
             
             if self.waiting_for_valley and (current_time - self.hysteresis_start_time) < self.hysteresis:
-                peak_threshold *= self.hysteresis_multiplier 
+                peak_threshold *= 1.0
 
             if current_volume > peak_threshold:
                 if not self.waiting_for_valley:
