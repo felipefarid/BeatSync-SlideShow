@@ -22,7 +22,7 @@ import queue
 # Configurações de Áudio e UI
 # -------------------------------------------------------------------
 SAMPLERATE = 48000
-BLOCKSIZE = 1536
+BLOCKSIZE = 768
 AUDIO_QUEUE_MAX = 8          
 RESULT_QUEUE_MAX = 64         
 PROCESSOR_SLEEP_ON_EMPTY = 0.005 
@@ -192,26 +192,30 @@ class ThreadProcessor(threading.Thread):
         self.recent_frequencies = []  
         
         # Histerese
-        self.hysteresis = 0.2        
+        self.hysteresis = 0.05        
         self.waiting_for_valley = False
         self.hysteresis_start_time = 0
         
         self.bass_levels = []
-        self.bass_window_size = 10
+        self.bass_window_size = 5
         
         self.peak_timestamps = [] 
-        self.peak_interval_window_size = 5
-        self.timing_buffer = 0.02
+        self.peak_interval_window_size = 10
+        self.timing_buffer = 0.05
         
-        self.default_interval = 0.2  
-        self.non_bass_override_factor = 3.0
+        self.default_interval = 0.01  
+        self.non_bass_override_factor = 2.0
 
         self.main_timing_list = [] 
 
         self.last_audio_time = time.time()
         self.silence_threshold = 0.5
         self.bass_cleaned = False
-        self.silence_volume_threshold = 0.01
+        self.silence_volume_threshold = 0.002
+
+        # Derivada
+        self.prev_volume = 0.0
+        self.volume_derivative = 0.0
 
     def run(self):
         print("[Processor] Thread de processamento iniciada (Lógica Simplificada)") 
@@ -239,9 +243,9 @@ class ThreadProcessor(threading.Thread):
                     continue
 
                 # VU Meter (Visual)
-                fft_result = np.fft.rfft(data) 
-                freqs = np.fft.rfftfreq(len(data), d=1.0 / self.samplerate) 
-                magnitude = np.abs(fft_result) 
+                fft_result = np.fft.rfft(data)
+                freqs = np.fft.rfftfreq(len(data), d=1.0 / self.samplerate)
+                magnitude = np.abs(fft_result)
 
                 band_energies = []
                 for (lo, hi) in self.freq_bands:
@@ -274,7 +278,7 @@ class ThreadProcessor(threading.Thread):
                     shared_state["last_fft_time"] = time.time() 
 
                 # Processamento de Lógica
-                self.process_beat_detection(data)
+                self.process_beat_detection(data, magnitude, freqs)
            
                 # Verificação de silêncio
                 current_time = time.time()
@@ -290,67 +294,57 @@ class ThreadProcessor(threading.Thread):
             except Exception as e:
                 print(f"[Processor] error: {e}") 
 
-    def process_beat_detection(self, audio_data):
+    def process_beat_detection(self, audio_data, magnitude, freqs):
         try:
             data = np.asarray(audio_data, dtype=np.float32)
-            if data.ndim > 1: data = data.flatten()
+            if data.ndim > 1:
+                data = data.flatten()
 
             raw_volume = np.sqrt(np.mean(data**2))
             current_time = time.time()
-         
-            if raw_volume > self.silence_volume_threshold: 
+
+            self.volume_derivative = raw_volume - self.prev_volume
+            self.prev_volume = raw_volume
+
+            if raw_volume > self.silence_volume_threshold:
                 self.last_audio_time = current_time
                 if self.bass_cleaned:
                     self.bass_cleaned = False
-            
-            self.volume_window.append(raw_volume) 
- 
-            if len(self.volume_window) > self.window_size: 
+
+            self.volume_window.append(raw_volume)
+            if len(self.volume_window) > self.window_size:
                 self.volume_window.pop(0)
 
-            bass_level = self.analyze_bass_level(data)
-            self.recent_frequencies.append(self.analyze_frequencies(data))
+            bass_level = self.analyze_bass_level(magnitude, freqs)
+
+            self.recent_frequencies.append(self.analyze_frequencies(magnitude, freqs))
             if len(self.recent_frequencies) > self.window_size:
                 self.recent_frequencies.pop(0)
 
-            if len(self.volume_window) == self.window_size and raw_volume > self.silence_volume_threshold: 
-                self.dynamic_detection(bass_level, raw_volume, current_time)
-            
+            if len(self.volume_window) == self.window_size and raw_volume > self.silence_volume_threshold:
+                self.dynamic_detection(bass_level, raw_volume, current_time, self.volume_derivative)
+
         except Exception as e:
             print(f"Erro process_beat: {e}")
 
-    def analyze_frequencies(self, audio_data):
+    def analyze_frequencies(self, magnitude, freqs):
         try:
-            if len(audio_data) < 2: return 0.0
-        
-            fft_result = np.fft.fft(audio_data) 
-            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate) 
-            magnitude = np.abs(fft_result) 
-            magnitude[0] = 0
             if len(magnitude) == 0: return 0.0
-            dominant_freq = freqs[np.argmax(magnitude)] 
+            dominant_freq = freqs[np.argmax(magnitude)]
             return abs(dominant_freq)
-       
-        except: return 0.0 
+        except: return 0.0
 
-    def analyze_bass_level(self, audio_data):
-        return self._analyze_frequency_band(audio_data, 10, 110)
+    def analyze_bass_level(self, magnitude, freqs):
+        return self._analyze_frequency_band(magnitude, freqs, 10, 110)
 
-    def _analyze_frequency_band(self, audio_data, min_freq, max_freq):
+    def _analyze_frequency_band(self, magnitude, freqs, min_freq, max_freq):
         try:
-            if len(audio_data) < 2: return 0.0
-            
-            fft_result = np.fft.fft(audio_data)
-            freqs = np.fft.fftfreq(len(fft_result), d=1/self.samplerate)
-      
-            magnitude = np.abs(fft_result) 
-            freq_mask = (np.abs(freqs) >= min_freq) & (np.abs(freqs) <= max_freq) 
+            freq_mask = (np.abs(freqs) >= min_freq) & (np.abs(freqs) <= max_freq)
             
             if np.any(freq_mask):
                 band_energy = np.sum(magnitude[freq_mask]**2)
                 num_bins = np.sum(freq_mask)
-           
-                if num_bins > 0: return band_energy / num_bins 
+                if num_bins > 0: return band_energy / num_bins
                 return band_energy
             return 0.0
         except: return 0.0
@@ -360,79 +354,108 @@ class ThreadProcessor(threading.Thread):
         intervals = [timing_list[i] - timing_list[i-1] for i in range(1, len(timing_list))] 
         return np.mean(intervals) if intervals else self.default_interval
 
-    def dynamic_detection(self, current_bass_level, current_volume, current_time):
+    def dynamic_detection(self, current_bass_level, current_volume, current_time, volume_derivative):
         try:
-            baseline = np.percentile(self.volume_window, 70)
+            baseline = np.percentile(self.volume_window, 90)
             valley_base = np.percentile(self.volume_window, 50)
-  
-            peak_threshold = baseline * self.volume_threshold_factor 
-            valley_threshold = valley_base * self.valley_threshold_factor 
-            
+
+            peak_threshold = baseline * self.volume_threshold_factor
+            valley_threshold = valley_base * self.valley_threshold_factor
+
+            # ---------------------------
+            # 🔥 FILTRO DE DERIVADA
+            # ---------------------------
+            DERIVATIVE_THRESHOLD = 0.003  # ajuste fino
+
+            if volume_derivative < DERIVATIVE_THRESHOLD:
+                return  # 🚫 ignora eco direto
+
+            # ---------------------------
+            # HISTERESIS
+            # ---------------------------
             if self.waiting_for_valley and (current_time - self.hysteresis_start_time) < self.hysteresis:
-                peak_threshold *= 1.0 
+                peak_threshold *= 1.0
 
             if current_volume > peak_threshold:
                 if not self.waiting_for_valley:
                     is_valid_peak = True
-                    
-                    if len(self.bass_levels) > 0: 
-                        avg_bass_level = np.mean(self.bass_levels) 
-                  
-                        if current_bass_level < (avg_bass_level * 0.6): 
-                            override_threshold = baseline * self.non_bass_override_factor 
+
+                    # ---------------------------
+                    # FILTRO DE BASS
+                    # ---------------------------
+                    if len(self.bass_levels) > 0:
+                        avg_bass_level = np.mean(self.bass_levels)
+
+                        if current_bass_level < (avg_bass_level * 0.6):
+                            override_threshold = baseline * self.non_bass_override_factor
 
                             if current_volume < override_threshold:
-                                is_valid_peak = False 
-                            
+                                is_valid_peak = False
                     else:
                         if current_bass_level < 0.001:
-                            is_valid_peak = False 
+                            is_valid_peak = False
 
-                    current_timing_list = self.main_timing_list 
+                    # ---------------------------
+                    # TIMING CHECK
+                    # ---------------------------
+                    current_timing_list = self.main_timing_list
 
-                    if is_valid_peak and len(current_timing_list) > 0: 
+                    if is_valid_peak and len(current_timing_list) > 0:
                         time_since_last_peak = current_time - current_timing_list[-1]
 
                         if len(current_timing_list) >= 2:
-                            intervals = [current_timing_list[i] - current_timing_list[i-1] 
-                                         for i in range(1, len(current_timing_list))] 
+                            intervals = [
+                                current_timing_list[i] - current_timing_list[i - 1]
+                                for i in range(1, len(current_timing_list))
+                            ]
                             avg_interval = np.mean(intervals)
 
                             if avg_interval <= 1.0:
-                                expected_time = avg_interval - self.timing_buffer 
+                                expected_time = avg_interval - self.timing_buffer
+
                                 if time_since_last_peak < expected_time:
-                                    time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0 
-                                    time_ratio = np.clip(time_ratio, 0.0, 1.0) 
-                                    
-                                    dynamic_threshold = 1.00 + 0.70 * (0.5 + 0.5 * np.cos(np.pi * time_ratio))**2 - 0.10 * time_ratio
+                                    time_ratio = time_since_last_peak / expected_time if expected_time > 0 else 0
+                                    time_ratio = np.clip(time_ratio, 0.0, 1.0)
+
+                                    dynamic_threshold = (
+                                        1.00
+                                        + 2.50 * (0.5 + 0.5 * np.cos(np.pi * time_ratio)) ** 2
+                                        - 0.10 * time_ratio
+                                    )
+
                                     required_threshold = peak_threshold * dynamic_threshold
 
                                     if current_volume < required_threshold:
-                                        is_valid_peak = False 
+                                        is_valid_peak = False
 
+                    # ---------------------------
+                    # DISPARO FINAL
+                    # ---------------------------
                     if is_valid_peak:
-                        self.bass_levels.append(current_bass_level) 
-                        if len(self.bass_levels) > self.bass_window_size: self.bass_levels.pop(0)
+                        self.bass_levels.append(current_bass_level)
+                        if len(self.bass_levels) > self.bass_window_size:
+                            self.bass_levels.pop(0)
 
-                        self.peak_timestamps.append(current_time) 
-                        if len(self.peak_timestamps) > 20: self.peak_timestamps.pop(0)
+                        self.peak_timestamps.append(current_time)
+                        if len(self.peak_timestamps) > 20:
+                            self.peak_timestamps.pop(0)
 
-                        self.update_timing_lists(current_time) 
+                        self.update_timing_lists(current_time)
 
                         avg_time_ms = self.calculate_list_avg(self.main_timing_list) * 1000
-                        
-                        # Dispara ação
-                        safe_put(beat_detection_queue, {"action": "change_image"}) 
-                        
+
+                        safe_put(beat_detection_queue, {"action": "change_image"})
+
                         avg_freq = np.mean(self.recent_frequencies) if self.recent_frequencies else 0
-                        print(f"🎵 Batida! | Freq: {avg_freq:.0f}Hz | Média Intervalo: {avg_time_ms:.2f}ms")
+                        print(f"🎵 Batida! | Freq: {avg_freq:.0f}Hz | ΔVol: {volume_derivative:.4f} | Intervalo: {avg_time_ms:.2f}ms")
 
                         self.waiting_for_valley = True
                         self.hysteresis_start_time = current_time
 
             elif current_volume < valley_threshold:
                 self.waiting_for_valley = False
-        except Exception as e: 
+
+        except Exception as e:
             print(f"Erro dynamic_detection: {e}")
 
     def update_timing_lists(self, current_time):
@@ -459,12 +482,13 @@ class ThreadProcessor(threading.Thread):
 # Player class
 # -------------------------
 class Player:
-    def __init__(self, root, image_paths, random_order=True):
+    def __init__(self, root, image_paths, random_order=True, on_close_callback=None):
         self.root = root
         self.image_paths = image_paths
         self.random_order = random_order
         self.image_index = 0
         self.running = True
+        self.on_close_callback = on_close_callback
         
         # ESSENCIAL: Armazena a referência da imagem *atualmente* exibida.
         self.tk_image = None
@@ -668,19 +692,21 @@ class Player:
                 self.initial_load() 
 
     def on_close(self):
-            print("🧹 Limpeza de Player iniciada.")
-            self.running = False
-            
-            # 🟢 ALTERAÇÃO 3A: Limpa o buffer de pré-carregamento
-            with self.image_load_lock:
-                self.preloaded_images.clear() 
-                self.loading_indices.clear()
-                
-            try:
-                self.viewer_window.destroy()
-            except Exception:
-                pass 
-            print("✅ Player encerrado e buffer limpo.")
+        print("🧹 Limpeza de Player iniciada.")
+        self.running = False
+        
+        with self.image_load_lock:
+            self.preloaded_images.clear()
+            self.loading_indices.clear()
+        
+        if self.on_close_callback:
+            self.on_close_callback(self)
+        
+        try:
+            self.viewer_window.destroy()
+        except Exception:
+            pass
+        print("✅ Player encerrado e buffer limpo.")
 
 # -------------------------
 # Main UI class
@@ -817,11 +843,16 @@ class ImageViewer:
 
     def _start_player_in_main_thread(self, image_paths, random_order):
         try:
-            player = Player(self.root, image_paths, random_order)
+            player = Player(self.root, image_paths, random_order, on_close_callback=self._remove_player)
             self.players.append(player)
             print(f"✅ Player criado com {len(image_paths)} imagens")
         except Exception as e:
             print(f"❌ Erro ao iniciar Player na thread principal: {e}")
+
+    def _remove_player(self, player):
+        if player in self.players:
+            self.players.remove(player)
+            print("✅ Player removido da lista.")
           
     def load_images(self, folder_path, image_formats, include_subfolders, random_order):
         image_paths = []
@@ -852,17 +883,20 @@ class ImageViewer:
             return [] 
 
     def handle_beat_detection(self):
+        had_beats = False
         try:
             while True:
                 command = beat_detection_queue.get_nowait()
                 if command["action"] == "change_image":
                     for player in self.players:
-                        player.next_image() 
+                        if player.running and player.tk_image is not None:
+                            had_beats = True
+                            player.next_image()
         except queue.Empty:
             pass
         
         if not self.stop_event.is_set():
-            self.beat_after_id = self.root.after(50, self.handle_beat_detection)
+            self.beat_after_id = self.root.after(16 if had_beats else 50, self.handle_beat_detection)
 
     def setup_waveform_view(self, parent_frame):
         frame = tk.Frame(parent_frame)
